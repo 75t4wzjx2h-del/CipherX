@@ -1,0 +1,111 @@
+[package]
+name = "cipherx"
+version = "0.1.0"
+edition = "2021"
+authors = ["CipherX Core Team"]
+description = "CipherX - Private, Decentralized, Uncensorable Blockchain"
+license = "MIT"
+
+[[bin]]
+name = "cipherx-node"
+path = "src/main.rs"
+
+[[bin]]
+name = "cipherx-wallet"
+path = "src/bin/wallet.rs"
+
+[lib]
+name = "cipherx"
+path = "src/lib.rs"
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Crypto primitives
+sha2 = "0.10"
+sha3 = "0.10"
+blake3 = "1.5"
+ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+curve25519-dalek = { version = "4.1", features = ["digest", "rand_core", "group"] }
+x25519-dalek = "2.0"
+rand = "0.8"
+rand_core = "0.6"
+hex = "0.4"
+bs58 = "0.5"
+zeroize = { version = "1.7", features = ["derive"] }
+
+# Ring signatures (Monero-style)
+merlin = "3.0"
+bulletproofs = "4.0"
+
+# Storage
+rocksdb = "0.21"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = "0.7"
+
+# Networking / P2P
+libp2p = { version = "0.53", features = [
+    "tcp",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "kad",
+    "identify",
+    "ping",
+    "macros",
+    "tokio",
+] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Config
+toml = "0.8"
+
+# Hashing utilities
+digest = "0.10"
+
+# zk-SNARKs (Groth16 stake proofs — Phase 4)
+ark-ff        = { version = "0.4", features = ["std"] }
+ark-r1cs-std  = { version = "0.4", features = ["std"] }
+ark-relations = { version = "0.4", features = ["std"] }
+ark-bn254     = { version = "0.4" }
+ark-groth16   = { version = "0.4", features = ["std"] }
+ark-snark     = { version = "0.4" }
+ark-serialize = { version = "0.4", features = ["std"] }
+ark-std       = { version = "0.4", features = ["std"] }
+
+# CLI wallet
+clap = { version = "4.5", features = ["derive"] }
+aes-gcm = "0.10"
+qrcode = "0.14"
+rpassword = "7.5"
+comfy-table = "7.1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+dirs = "5.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true

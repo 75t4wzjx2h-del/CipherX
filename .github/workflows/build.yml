@@ -1,0 +1,44 @@
+name: Build CipherX Wallet
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Build wallet
+        run: cargo build --release --bin cipherx-wallet
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cipherx-wallet-windows
+          path: target/release/cipherx-wallet.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install deps
+        run: sudo apt install -y libclang-dev librocksdb-dev cmake
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Build wallet
+        run: cargo build --release --bin cipherx-wallet
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cipherx-wallet-linux
+          path: target/release/cipherx-wallet
