@@ -393,4 +393,40 @@ mod tests {
         let result = sign_ring(b"msg", &[pk], 0, &sk);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_forge_with_wrong_key_fails() {
+        // Attacker has their own keypair but their pubkey is NOT in the ring.
+        // They attempt to forge a signature by signing with their own key at
+        // some real_index whose pubkey actually belongs to someone else.
+        // Verification must reject the signature.
+        let (_real_sk, pk_real) = gen_keypair();
+        let (attacker_sk, _attacker_pk) = gen_keypair();
+        let mut ring: Vec<[u8; 32]> = vec![[0u8; 32]; 10];
+        ring[3] = pk_real; // legitimate ring member at index 3
+        let msg = b"steal funds";
+
+        // Attacker signs claiming to be index 3 (which is the real signer's slot)
+        // — but they don't know the real_sk. They use their own attacker_sk.
+        let (sig_bytes, ki) = sign_ring(msg, &ring, 3, &attacker_sk).unwrap();
+        // Verification must fail because the ring won't close: the s_π = α - c·x
+        // computation uses x ≠ log_G(P_π), so reconstructed L_π differs.
+        assert!(!verify_ring(msg, &ring, &sig_bytes, &ki),
+            "forged signature (wrong key for slot) must be rejected");
+    }
+
+    #[test]
+    fn test_tampered_signature_fails() {
+        // Original valid signature whose bytes are then flipped — must fail.
+        let (sk, pk_real) = gen_keypair();
+        let mut ring = vec![[0u8; 32]; 10];
+        ring[0] = pk_real;
+        let msg = b"tx";
+        let (mut sig_bytes, ki) = sign_ring(msg, &ring, 0, &sk).unwrap();
+        // Flip a byte in the middle of the signature (s vector area)
+        let i = sig_bytes.len() / 2;
+        sig_bytes[i] ^= 0x01;
+        assert!(!verify_ring(msg, &ring, &sig_bytes, &ki),
+            "tampered signature bytes must be rejected");
+    }
 }

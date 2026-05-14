@@ -608,6 +608,37 @@ mod tests {
     }
 
     #[test]
+    fn test_inflation_impossible_with_balance_check() {
+        // Honest builder: inputs 10 + 5 = 15 nCIP, outputs 12 + 3 (fee) = 15. Balances.
+        let valid = build_tx_commitments(&[10u64, 5], &[12u64], 3).unwrap();
+        assert!(verify_balance(
+            &valid.input_pseudo_commitments,
+            &valid.output_commitments,
+            &valid.fee_commitment,
+        ), "honest balanced tx must verify");
+
+        // Attempt inflation: same builder forces blindings to match,
+        // so if amounts don't balance the commitment difference
+        // becomes (Δv)·H ≠ identity → balance check must reject.
+        // Inputs = 10, outputs = 11, fee = 0 → +1 nCIP created from thin air.
+        let inflated = build_tx_commitments(&[10u64], &[11u64], 0).unwrap();
+        let rejected = !verify_balance(
+            &inflated.input_pseudo_commitments,
+            &inflated.output_commitments,
+            &inflated.fee_commitment,
+        );
+        assert!(rejected, "inflation (output > input) must be rejected by balance check");
+
+        // Symmetric: inputs > outputs+fee → also unbalanced (lost CIP), also rejected.
+        let burn = build_tx_commitments(&[10u64], &[5u64], 0).unwrap();
+        assert!(!verify_balance(
+            &burn.input_pseudo_commitments,
+            &burn.output_commitments,
+            &burn.fee_commitment,
+        ), "deflation (input > output+fee) must also be rejected");
+    }
+
+    #[test]
     fn test_commitments_are_homomorphic() {
         // C(a) + C(b) == C(a+b) with consistent blindings
         let a = 3u64;
