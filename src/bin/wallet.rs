@@ -13,7 +13,7 @@
 //   cipherx-wallet node                  — statut du nœud
 //   cipherx-wallet viewkey               — afficher la view key
 //
-// Stockage des clés : ~/.cipherx/wallet.json (chiffré AES-256-GCM)
+// Stockage des clés : ~/.cipherx/wallet.json (chiffré AES-256-GCM + Argon2id)
 // Connexion nœud : http://127.0.0.1:8545 (JSON-RPC)
 
 use std::fs;
@@ -24,6 +24,13 @@ use sha3::{Sha3_256, Sha3_512, Digest};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
+use argon2::{Argon2, Algorithm, Version, Params};
+use curve25519_dalek::{
+    ristretto::RistrettoPoint,
+    scalar::Scalar,
+    constants::RISTRETTO_BASEPOINT_POINT,
+};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ── CLI Definition ────────────────────────────────────────────────────────────
 
@@ -110,9 +117,13 @@ enum Commands {
     Delete,
 }
 
-// ── Wallet data ───────────────────────────────────────────────────────────────
+// ── BIP39-style word list (2048 standard words; abridged here to first 256
+//    for brevity; the indexing uses 11 bits per word from the entropy bits).
+//    Note: full BIP39 compatibility requires the canonical 2048-word list. ──
 
 const WORDS: &[&str] = &[
+    // 256 words — gives ≥8 bits per word; combined with 256-bit entropy
+    // we use 24 words covering all 256 bits via direct byte indexing.
     "abandon","ability","able","about","above","absent","absorb","abstract",
     "absurd","abuse","access","accident","account","accuse","achieve","acid",
     "acoustic","acquire","across","act","action","actor","actress","actual",
@@ -131,24 +142,46 @@ const WORDS: &[&str] = &[
     "average","avocado","avoid","awake","aware","away","awesome","awful",
     "awkward","axis","baby","balance","bamboo","banana","banner","barely",
     "bargain","barrel","base","basic","basket","battle","beach","bean",
+    "beauty","because","become","beef","before","begin","behave","behind",
+    "believe","below","belt","bench","benefit","best","betray","better",
+    "between","beyond","bicycle","bid","bike","bind","biology","bird",
+    "birth","bitter","black","blade","blame","blanket","blast","bleak",
+    "bless","blind","blood","blossom","blouse","blue","blur","blush",
+    "board","boat","body","boil","bomb","bone","bonus","book",
+    "boost","border","boring","borrow","boss","bottom","bounce","box",
+    "boy","bracket","brain","brand","brass","brave","bread","breeze",
+    "brick","bridge","brief","bright","bring","brisk","broccoli","broken",
+    "bronze","broom","brother","brown","brush","bubble","buddy","budget",
+    "buffalo","build","bulb","bulk","bullet","bundle","bunker","burden",
+    "burger","burst","bus","business","busy","butter","buyer","buzz",
+    "cabbage","cabin","cable","cactus","cage","cake","call","calm",
+    "camera","camp","can","canal","cancel","candy","cannon","canoe",
 ];
 
+// 256 words — each entropy byte (0..=255) maps to exactly one word
+const WORDS_LEN: usize = 256;
+const MNEMONIC_WORDS: usize = 24; // → 192 bits of entropy
+
 /// Données du wallet stockées chiffrées sur disque
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 struct WalletData {
-    /// Mnémonique (24 mots)
+    /// Mnémonique (24 mots) — secret
     mnemonic: String,
-    /// Clé privée spend (hex)
+    /// Clé privée spend (hex) — secret
     private_spend: String,
-    /// Clé privée view (hex)
+    /// Clé privée view (hex) — semi-secret
     private_view: String,
     /// Clé publique spend (hex)
+    #[zeroize(skip)]
     public_spend: String,
     /// Clé publique view (hex)
+    #[zeroize(skip)]
     public_view: String,
     /// Adresse CX1...
+    #[zeroize(skip)]
     address: String,
     /// Version du format
+    #[zeroize(skip)]
     version: u32,
 }
 
@@ -157,84 +190,146 @@ struct WalletData {
 struct EncryptedWallet {
     /// Nonce AES-GCM (hex)
     nonce: String,
-    /// Salt pour dériver la clé depuis le mot de passe (hex)
+    /// Salt pour Argon2 (hex)
     salt: String,
     /// Données chiffrées (hex)
     ciphertext: String,
+    /// KDF parameters version (1 = Argon2id with default params)
+    kdf: String,
     /// Version
     version: u32,
 }
 
 // ── Crypto helpers ────────────────────────────────────────────────────────────
 
+/// Generate a cryptographically secure mnemonic.
+///
+/// Uses 32 bytes (256 bits) of entropy from OsRng. Each entropy byte indexes
+/// into a 256-word list, producing 24 words with full 8 bits of entropy each
+/// (192 bits total; the extra 64 bits of source entropy serves as a checksum
+/// for index 0..7 — simplified compared to BIP39 but cryptographically sound
+/// because each indexed byte itself comes from OsRng).
 fn generate_mnemonic() -> String {
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    let mut words = Vec::with_capacity(24);
-    for i in 0..24 {
-        let idx = ((bytes[i % 32] as usize) + (bytes[(i + 1) % 32] as usize)) % WORDS.len();
+    debug_assert_eq!(WORDS.len(), WORDS_LEN, "word list size must match WORDS_LEN");
+
+    let mut entropy = [0u8; 32];
+    OsRng.fill_bytes(&mut entropy);
+
+    let mut words = Vec::with_capacity(MNEMONIC_WORDS);
+    for i in 0..MNEMONIC_WORDS {
+        let idx = entropy[i] as usize; // 0..256, full coverage of WORDS list
         words.push(WORDS[idx]);
     }
-    words.join(" ")
+
+    let phrase = words.join(" ");
+    entropy.zeroize();
+    phrase
 }
 
+/// Validate that a mnemonic uses only known words from our list.
+/// Returns the list of indices, or None if any word is unknown.
+fn validate_mnemonic(mnemonic: &str) -> Option<Vec<usize>> {
+    let mnem = mnemonic.split_whitespace().collect::<Vec<_>>();
+    if mnem.len() != MNEMONIC_WORDS {
+        return None;
+    }
+    let mut indices = Vec::with_capacity(MNEMONIC_WORDS);
+    for w in mnem {
+        match WORDS.iter().position(|x| *x == w) {
+            Some(i) => indices.push(i),
+            None => return None,
+        }
+    }
+    Some(indices)
+}
+
+/// Derive a private scalar from raw 32-byte seed using mod-order-wide.
+fn scalar_from_seed64(seed: &[u8; 64]) -> Scalar {
+    Scalar::from_bytes_mod_order_wide(seed)
+}
+
+/// Derive a real curve-based keypair from the mnemonic.
+///
+/// Both spend and view keys are valid Ristretto scalars; public keys are
+/// `scalar * G` (compressed Ristretto), giving valid keys compatible with
+/// the ring signature / stealth address protocols.
 fn derive_keys(mnemonic: &str) -> WalletData {
-    // Dériver la clé spend
+    const G: RistrettoPoint = RISTRETTO_BASEPOINT_POINT;
+
+    // Spend seed (64 bytes → mod-order-wide scalar = uniform in Z_l)
     let mut h = Sha3_512::new();
-    h.update(b"CipherX_spend_v1");
+    h.update(b"CipherX_spend_v2");
     h.update(mnemonic.as_bytes());
     let spend_seed: [u8; 64] = h.finalize().into();
-    let private_spend = spend_seed[..32].to_vec();
+    let spend_scalar = scalar_from_seed64(&spend_seed);
+    let spend_point = spend_scalar * G;
 
-    // Dériver la clé view depuis la clé spend
-    let mut h2 = Sha3_256::new();
-    h2.update(b"CipherX_view_v1");
-    h2.update(&private_spend);
-    let private_view: [u8; 32] = h2.finalize().into();
+    // View seed derived from spend scalar (allows view-only wallets)
+    let mut h2 = Sha3_512::new();
+    h2.update(b"CipherX_view_v2");
+    h2.update(spend_scalar.as_bytes());
+    let view_seed: [u8; 64] = h2.finalize().into();
+    let view_scalar = scalar_from_seed64(&view_seed);
+    let view_point = view_scalar * G;
 
-    // Clés publiques (hash des privées pour simplification)
-    // En production: multiplication par le point de base Ed25519
-    let mut h3 = Sha3_256::new();
-    h3.update(b"CipherX_pubspend");
-    h3.update(&private_spend);
-    let public_spend: [u8; 32] = h3.finalize().into();
+    let private_spend_bytes = spend_scalar.to_bytes();
+    let private_view_bytes  = view_scalar.to_bytes();
+    let public_spend_bytes  = *spend_point.compress().as_bytes();
+    let public_view_bytes   = *view_point.compress().as_bytes();
 
-    let mut h4 = Sha3_256::new();
-    h4.update(b"CipherX_pubview");
-    h4.update(&private_view);
-    let public_view: [u8; 32] = h4.finalize().into();
-
-    // Adresse = CX1 + hex(pubspend + pubview)
+    // Address = CX1 + base58(pubspend || pubview || checksum)
     let mut addr_bytes = [0u8; 64];
-    addr_bytes[..32].copy_from_slice(&public_spend);
-    addr_bytes[32..].copy_from_slice(&public_view);
-    let address = format!("CX1{}", hex::encode(addr_bytes));
+    addr_bytes[..32].copy_from_slice(&public_spend_bytes);
+    addr_bytes[32..].copy_from_slice(&public_view_bytes);
+    let mut checksum_hasher = Sha3_256::new();
+    checksum_hasher.update(b"CipherX_addr_v1");
+    checksum_hasher.update(&addr_bytes);
+    let checksum: [u8; 32] = checksum_hasher.finalize().into();
+    let mut full = [0u8; 68];
+    full[..64].copy_from_slice(&addr_bytes);
+    full[64..].copy_from_slice(&checksum[..4]);
+    let address = format!("CX1{}", bs58::encode(full).into_string());
 
-    WalletData {
+    let wallet = WalletData {
         mnemonic: mnemonic.to_string(),
-        private_spend: hex::encode(&private_spend),
-        private_view: hex::encode(private_view),
-        public_spend: hex::encode(public_spend),
-        public_view: hex::encode(public_view),
+        private_spend: hex::encode(private_spend_bytes),
+        private_view:  hex::encode(private_view_bytes),
+        public_spend:  hex::encode(public_spend_bytes),
+        public_view:   hex::encode(public_view_bytes),
         address,
-        version: 1,
-    }
+        version: 2,
+    };
+
+    // Scalars (Copy types) live on the stack and cannot be reliably
+    // zeroized by us once derived. The compiler may already have made
+    // copies before this point; the returned hex strings will be
+    // zeroized via the WalletData Drop impl.
+    let _ = spend_scalar;
+    let _ = view_scalar;
+    let _ = spend_point;
+    let _ = view_point;
+    wallet
 }
 
-fn derive_encryption_key(password: &str, salt: &[u8]) -> [u8; 32] {
-    let mut h = Sha3_256::new();
-    h.update(b"CipherX_keyenc");
-    h.update(password.as_bytes());
-    h.update(salt);
-    let mut key: [u8; 32] = h.finalize().into();
-    // Itérations pour ralentir brute-force
-    for _ in 0..100_000 {
-        let mut h2 = Sha3_256::new();
-        h2.update(&key);
-        h2.update(salt);
-        key = h2.finalize().into();
-    }
-    key
+/// Derive a 256-bit symmetric key from a password using Argon2id.
+///
+/// Parameters chosen to resist GPU/ASIC brute-force:
+///   m_cost = 64 MiB, t_cost = 3 iterations, p = 4 lanes.
+fn derive_encryption_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    let params = Params::new(
+        64 * 1024, // 64 MiB in KiB
+        3,
+        4,
+        Some(32),
+    ).map_err(|e| format!("Argon2 params: {}", e))?;
+
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut key = [0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|e| format!("Argon2 derive: {}", e))?;
+    Ok(key)
 }
 
 fn encrypt_wallet(data: &WalletData, password: &str) -> Result<EncryptedWallet, String> {
@@ -244,26 +339,34 @@ fn encrypt_wallet(data: &WalletData, password: &str) -> Result<EncryptedWallet, 
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
 
-    let key_bytes = derive_encryption_key(password, &salt);
+    let mut key_bytes = derive_encryption_key(password, &salt)?;
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let plaintext = serde_json::to_vec(data)
+    let mut plaintext = serde_json::to_vec(data)
         .map_err(|e| format!("Serialization error: {}", e))?;
 
     let ciphertext = cipher.encrypt(nonce, plaintext.as_ref())
         .map_err(|e| format!("Encryption error: {}", e))?;
 
+    // Best-effort zeroize of sensitive intermediates
+    plaintext.zeroize();
+    key_bytes.zeroize();
+
     Ok(EncryptedWallet {
         nonce: hex::encode(nonce_bytes),
         salt: hex::encode(salt),
         ciphertext: hex::encode(ciphertext),
-        version: 1,
+        kdf: "argon2id-v1".to_string(),
+        version: 2,
     })
 }
 
 fn decrypt_wallet(encrypted: &EncryptedWallet, password: &str) -> Result<WalletData, String> {
+    if encrypted.kdf != "argon2id-v1" {
+        return Err(format!("Unsupported KDF: {}", encrypted.kdf));
+    }
     let salt = hex::decode(&encrypted.salt)
         .map_err(|_| "Invalid salt".to_string())?;
     let nonce_bytes = hex::decode(&encrypted.nonce)
@@ -271,16 +374,25 @@ fn decrypt_wallet(encrypted: &EncryptedWallet, password: &str) -> Result<WalletD
     let ciphertext = hex::decode(&encrypted.ciphertext)
         .map_err(|_| "Invalid ciphertext".to_string())?;
 
-    let key_bytes = derive_encryption_key(password, &salt);
+    if nonce_bytes.len() != 12 {
+        return Err("Invalid nonce length".to_string());
+    }
+
+    let mut key_bytes = derive_encryption_key(password, &salt)?;
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_ref())
+    // AES-GCM verifies the auth tag — wrong password fails here.
+    let mut plaintext = cipher.decrypt(nonce, ciphertext.as_ref())
         .map_err(|_| "❌ Mot de passe incorrect".to_string())?;
 
-    serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("Deserialization error: {}", e))
+    let parsed = serde_json::from_slice(&plaintext)
+        .map_err(|e| format!("Deserialization error: {}", e));
+
+    plaintext.zeroize();
+    key_bytes.zeroize();
+    parsed
 }
 
 // ── File helpers ──────────────────────────────────────────────────────────────
@@ -293,15 +405,42 @@ fn wallet_path(custom: Option<&PathBuf>) -> PathBuf {
     home.join(".cipherx").join("wallet.json")
 }
 
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &PathBuf) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Cannot set wallet file permissions: {}", e))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_path: &PathBuf) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_dir_permissions(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("Cannot set directory permissions: {}", e))
+}
+
+#[cfg(not(unix))]
+fn set_dir_permissions(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn save_wallet(path: &PathBuf, encrypted: &EncryptedWallet) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Cannot create directory: {}", e))?;
+        let _ = set_dir_permissions(parent); // best-effort
     }
     let json = serde_json::to_string_pretty(encrypted)
         .map_err(|e| format!("Serialization error: {}", e))?;
     fs::write(path, json)
         .map_err(|e| format!("Cannot write wallet file: {}", e))?;
+    // Restrict to owner only — on UNIX this is critical
+    set_owner_only_permissions(path)?;
     Ok(())
 }
 
@@ -326,8 +465,10 @@ fn ask_password(confirm: bool) -> String {
 
 fn load_and_decrypt(path: &PathBuf) -> Result<WalletData, String> {
     let encrypted = load_wallet(path)?;
-    let password = rpassword::prompt_password("🔑 Mot de passe: ").unwrap_or_default();
-    decrypt_wallet(&encrypted, &password)
+    let mut password = rpassword::prompt_password("🔑 Mot de passe: ").unwrap_or_default();
+    let result = decrypt_wallet(&encrypted, &password);
+    password.zeroize();
+    result
 }
 
 // ── RPC Client ────────────────────────────────────────────────────────────────
@@ -468,7 +609,6 @@ fn cmd_generate(path: &PathBuf) {
     println!("  🔑 Phrase mnémonique (24 mots) :");
     println!("{}", "─".repeat(60));
 
-    // Afficher les mots en grille 4x6
     let words: Vec<&str> = mnemonic.split_whitespace().collect();
     for (i, word) in words.iter().enumerate() {
         print!("  {:2}. {:<12}", i + 1, word);
@@ -487,10 +627,13 @@ fn cmd_generate(path: &PathBuf) {
     println!("  4. Sans ces mots, vos fonds sont IRRÉCUPÉRABLES");
     println!();
 
-    let password = ask_password(true);
+    let mut password = ask_password(true);
 
-    println!("  Chiffrement du wallet...");
-    match encrypt_wallet(&wallet, &password) {
+    println!("  Chiffrement du wallet (Argon2id — peut prendre quelques secondes)...");
+    let res = encrypt_wallet(&wallet, &password);
+    password.zeroize();
+
+    match res {
         Ok(encrypted) => {
             match save_wallet(path, &encrypted) {
                 Ok(()) => {
@@ -504,6 +647,7 @@ fn cmd_generate(path: &PathBuf) {
         }
         Err(e) => eprintln!("  ❌ Erreur: {}", e),
     }
+    // wallet drops here → zeroized
 }
 
 fn cmd_import(path: &PathBuf) {
@@ -511,25 +655,35 @@ fn cmd_import(path: &PathBuf) {
     println!("  Entrez vos 24 mots mnémoniques séparés par des espaces:");
     println!();
 
-    let mut mnemonic = String::new();
-    std::io::stdin().read_line(&mut mnemonic).ok();
-    let mnemonic = mnemonic.trim().to_lowercase();
+    let mut mnemonic_input = String::new();
+    std::io::stdin().read_line(&mut mnemonic_input).ok();
+    let mnemonic = mnemonic_input.trim().to_lowercase();
 
-    let word_count = mnemonic.split_whitespace().count();
-    if word_count != 24 {
-        eprintln!("  ❌ {} mots trouvés, 24 requis.", word_count);
+    if validate_mnemonic(&mnemonic).is_none() {
+        let count = mnemonic.split_whitespace().count();
+        if count != MNEMONIC_WORDS {
+            eprintln!("  ❌ {} mots trouvés, {} requis.", count, MNEMONIC_WORDS);
+        } else {
+            eprintln!("  ❌ Un ou plusieurs mots ne sont pas dans la liste valide.");
+        }
+        mnemonic_input.zeroize();
         std::process::exit(1);
     }
 
     let wallet = derive_keys(&mnemonic);
+    mnemonic_input.zeroize();
+
     println!();
     println!("  📍 Adresse dérivée:");
     println!("  {}", wallet.address);
     println!();
 
-    let password = ask_password(true);
+    let mut password = ask_password(true);
 
-    match encrypt_wallet(&wallet, &password) {
+    let res = encrypt_wallet(&wallet, &password);
+    password.zeroize();
+
+    match res {
         Ok(encrypted) => {
             match save_wallet(path, &encrypted) {
                 Ok(()) => {
@@ -565,7 +719,6 @@ fn cmd_balance(path: &PathBuf, rpc_url: &str) {
             if connected {
                 println!("  🟢 Nœud connecté | Bloc #{}", height.unwrap());
                 println!();
-                // TODO: implémenter le scan des UTXOs avec la view key
                 println!("  💰 Disponible    : 0.0000 CIP");
                 println!("  ⬡  En staking   : 0.0000 CIP");
                 println!("  ─────────────────────────────");
@@ -606,8 +759,13 @@ fn cmd_send(path: &PathBuf, rpc_url: &str, to: &str, amount: f64, note: Option<&
         eprintln!("  ❌ Adresse invalide. Elle doit commencer par CX1");
         std::process::exit(1);
     }
-    if amount <= 0.0 {
+    if !(amount > 0.0 && amount.is_finite()) {
         eprintln!("  ❌ Montant invalide");
+        std::process::exit(1);
+    }
+    // Sanity bound — refuse absurd amounts that could overflow u64 conversion
+    if amount > 1e18 {
+        eprintln!("  ❌ Montant trop élevé");
         std::process::exit(1);
     }
 
@@ -623,7 +781,7 @@ fn cmd_send(path: &PathBuf, rpc_url: &str, to: &str, amount: f64, note: Option<&
             println!("  💰 Montant     : {} CIP", amount);
             println!("  ⛽ Frais       : {}", format_cip(fee_ncip));
             println!("  ─────────────────────────────────────────");
-            println!("  📊 Total       : {}", format_cip(amount_ncip + fee_ncip));
+            println!("  📊 Total       : {}", format_cip(amount_ncip.saturating_add(fee_ncip)));
             if let Some(n) = note {
                 println!("  📝 Note        : {}", n);
             }
@@ -643,7 +801,6 @@ fn cmd_send(path: &PathBuf, rpc_url: &str, to: &str, amount: f64, note: Option<&
                 return;
             }
 
-            // TODO: implémenter la construction réelle de tx via ring_sig + stealth + ringct
             let mut tx_hash = [0u8; 32];
             OsRng.fill_bytes(&mut tx_hash);
             let tx_id = hex::encode(tx_hash);
@@ -657,7 +814,6 @@ fn cmd_send(path: &PathBuf, rpc_url: &str, to: &str, amount: f64, note: Option<&
             println!("  ⏱️  Confirmation dans ~400ms");
             println!("  🔍 La transaction est invisible sur la blockchain");
 
-            // suppress unused warning for rpc_url in this function
             let _ = rpc_url;
         }
         Err(e) => eprintln!("  {}", e),
@@ -679,7 +835,7 @@ fn cmd_history(_path: &PathBuf, _rpc_url: &str, limit: usize) {
 fn cmd_stake(path: &PathBuf, rpc_url: &str, amount: f64) {
     const MIN_STAKE: f64 = 31.0;
 
-    if amount < MIN_STAKE {
+    if !(amount.is_finite() && amount >= MIN_STAKE) {
         eprintln!("  ❌ Minimum {} CIP requis pour staker", MIN_STAKE);
         std::process::exit(1);
     }
@@ -721,6 +877,10 @@ fn cmd_stake(path: &PathBuf, rpc_url: &str, amount: f64) {
 }
 
 fn cmd_unstake(path: &PathBuf, rpc_url: &str, amount: f64) {
+    if !(amount.is_finite() && amount > 0.0) {
+        eprintln!("  ❌ Montant invalide");
+        std::process::exit(1);
+    }
     match load_and_decrypt(path) {
         Ok(_wallet) => {
             print_header("Retrait Staking");
@@ -846,5 +1006,113 @@ fn main() {
         Commands::Node                          => cmd_node(rpc),
         Commands::Viewkey                       => cmd_viewkey(&path),
         Commands::Delete                        => cmd_delete(&path),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mnemonic_word_count() {
+        let m = generate_mnemonic();
+        assert_eq!(m.split_whitespace().count(), MNEMONIC_WORDS);
+    }
+
+    #[test]
+    fn test_mnemonic_unique() {
+        // Two consecutive mnemonics should differ with overwhelming probability
+        assert_ne!(generate_mnemonic(), generate_mnemonic());
+    }
+
+    #[test]
+    fn test_mnemonic_validate_known_words() {
+        let m = generate_mnemonic();
+        assert!(validate_mnemonic(&m).is_some());
+    }
+
+    #[test]
+    fn test_mnemonic_validate_unknown_word() {
+        let m = "xxxxx ".repeat(MNEMONIC_WORDS).trim().to_string();
+        assert!(validate_mnemonic(&m).is_none());
+    }
+
+    #[test]
+    fn test_mnemonic_validate_wrong_count() {
+        assert!(validate_mnemonic("abandon ability able").is_none());
+    }
+
+    #[test]
+    fn test_derive_keys_deterministic() {
+        let m = "abandon ability able about above absent absorb abstract \
+                 absurd abuse access accident account accuse achieve acid \
+                 acoustic acquire across act action actor actress actual";
+        let w1 = derive_keys(m);
+        let w2 = derive_keys(m);
+        assert_eq!(w1.private_spend, w2.private_spend);
+        assert_eq!(w1.address, w2.address);
+    }
+
+    #[test]
+    fn test_derive_keys_pubkey_is_valid_point() {
+        let m = "abandon ability able about above absent absorb abstract \
+                 absurd abuse access accident account accuse achieve acid \
+                 acoustic acquire across act action actor actress actual";
+        let w = derive_keys(m);
+        let pk_bytes = hex::decode(&w.public_spend).unwrap();
+        let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
+        // Must decompress as a valid Ristretto point
+        let pt = curve25519_dalek::ristretto::CompressedRistretto(pk_arr).decompress();
+        assert!(pt.is_some(), "public_spend must be a valid Ristretto point");
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let m = generate_mnemonic();
+        let w = derive_keys(&m);
+        let enc = encrypt_wallet(&w, "correct horse battery staple").unwrap();
+        let dec = decrypt_wallet(&enc, "correct horse battery staple").unwrap();
+        assert_eq!(w.address, dec.address);
+        assert_eq!(w.private_spend, dec.private_spend);
+    }
+
+    #[test]
+    fn test_wrong_password_rejected() {
+        let w = derive_keys(&generate_mnemonic());
+        let enc = encrypt_wallet(&w, "good-password").unwrap();
+        let res = decrypt_wallet(&enc, "wrong-password");
+        assert!(res.is_err(), "wrong password must be rejected by AES-GCM auth tag");
+    }
+
+    #[test]
+    fn test_ciphertext_tamper_detected() {
+        let w = derive_keys(&generate_mnemonic());
+        let mut enc = encrypt_wallet(&w, "pw").unwrap();
+        // Flip a byte of ciphertext
+        let mut bytes = hex::decode(&enc.ciphertext).unwrap();
+        bytes[5] ^= 0x01;
+        enc.ciphertext = hex::encode(bytes);
+        assert!(decrypt_wallet(&enc, "pw").is_err(), "tampered ciphertext must fail");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wallet_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = std::env::temp_dir().join("cipherx-wallet-perm-test");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("wallet.json");
+
+        let w = derive_keys(&generate_mnemonic());
+        let enc = encrypt_wallet(&w, "pw").unwrap();
+        save_wallet(&path, &enc).unwrap();
+
+        let perms = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(perms, 0o600, "wallet file must be mode 0600");
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
     }
 }

@@ -33,6 +33,10 @@ use rand_core::RngCore;
 #[allow(unused_imports)]
 use serde::{Serialize, Deserialize};
 use zeroize::Zeroize;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Key, Nonce,
+};
 
 use crate::core::transaction::{PedersenCommitment, Bulletproof};
 
@@ -139,92 +143,323 @@ pub fn verify_balance(
 /// Compute the blinding factor balance for outputs given input blindings.
 /// Used by sender to ensure sum(r_in) = sum(r_out) + r_fee
 /// Returns the required fee blinding: r_fee = sum(r_in) - sum(r_out)
+///
+/// Returns None if any blinding factor fails to parse as a valid scalar —
+/// silently skipping invalid blindings would produce a wrong fee_blinding
+/// and a tx that fails balance verification (or worse, balances incorrectly).
 pub fn compute_fee_blinding(
     input_blindings: &[[u8; 32]],
     output_blindings: &[[u8; 32]],
 ) -> Option<[u8; 32]> {
-    let sum_in: Scalar = input_blindings.iter()
-        .filter_map(|b| scalar_from_bytes(b))
-        .fold(Scalar::ZERO, |acc, s| acc + s);
-
-    let sum_out: Scalar = output_blindings.iter()
-        .filter_map(|b| scalar_from_bytes(b))
-        .fold(Scalar::ZERO, |acc, s| acc + s);
-
+    let mut sum_in = Scalar::ZERO;
+    for b in input_blindings {
+        sum_in += scalar_from_bytes(b)?;
+    }
+    let mut sum_out = Scalar::ZERO;
+    for b in output_blindings {
+        sum_out += scalar_from_bytes(b)?;
+    }
     Some((sum_in - sum_out).to_bytes())
 }
 
-// ─── Range proofs (Bulletproofs) ──────────────────────────────────────────────
+// ─── Range proofs (bit-decomposition) ─────────────────────────────────────────
 //
-// The bulletproofs crate requires a specific setup with generators.
-// For Phase 3 we implement the interface and use a simplified inner
-// product proof. Full aggregated Bulletproofs++ in Phase 4.
+// SECURITY NOTE — Phase 3 implementation:
 //
-// For now: we use a commitment-based range check stub that structurally
-// represents the real proof, allowing the rest of the system to compile
-// and run. Replace `prove_range_inner` with real BP when integrating
-// the bulletproofs crate fully.
+// The original Phase 3 stub embedded `amount || blinding` in the proof,
+// which trivially LEAKS the amount and defeats RingCT privacy entirely.
+//
+// This implementation provides a real range proof via bit-decomposition
+// of the amount into 64 bits. For each bit b_i ∈ {0,1}:
+//   - We commit C_i = b_i·H + r_i·G
+//   - We provide a 0-or-1 OR-proof for C_i (Borromean-style sigma proof)
+//   - We constrain sum_i 2^i · C_i = C (the original commitment)
+//
+// Verification:
+//   - Each per-bit proof verifies the commitment is to {0,1}.
+//   - The reconstruction check binds the bit-commitments to C, so the
+//     committed amount equals sum_i 2^i b_i ∈ [0, 2^64).
+//
+// This is conceptually equivalent to the range-proof structure used in
+// pre-Bulletproofs Monero (Borromean ring sigs on bit commitments).
+// Bulletproofs++ migration is tracked for Phase 4 — the on-chain
+// representation is opaque so swapping the proof system is non-breaking.
 
-/// Generate a range proof for an amount commitment.
-/// Proves: v ∈ [0, 2^64) without revealing v.
+const RANGE_BITS: usize = 64;
+
+fn hash_to_scalar(data: &[&[u8]]) -> Scalar {
+    let mut h = Sha3_512::new();
+    h.update(b"CipherX_range_v1");
+    for d in data { h.update(d); }
+    let hash = h.finalize();
+    let mut bytes = [0u8; 64];
+    bytes.copy_from_slice(&hash);
+    Scalar::from_bytes_mod_order_wide(&bytes)
+}
+
+/// Generate a range proof for an amount commitment using bit decomposition.
+///
+/// Proof structure (binary serialization):
+///   For each bit i in [0, 64):
+///     - bit_commitment   : 32 bytes (C_i = b_i*H + r_i*G)
+///     - bit_proof_e0     : 32 bytes
+///     - bit_proof_e1     : 32 bytes
+///     - bit_proof_s0     : 32 bytes
+///     - bit_proof_s1     : 32 bytes
+///   Plus a consistency tag (32 bytes): H("range" || C || C_0 || ... || C_63)
+///
+/// The verifier checks each bit-proof and then verifies that
+/// `sum_i 2^i * C_i == C`, which forces sum_i 2^i * b_i = v and sum_i 2^i * r_i = r.
 pub fn prove_range(amount: u64, blinding: &[u8; 32]) -> Option<Bulletproof> {
-    // Stub: encode amount and blinding into proof bytes
-    // REAL impl: use bulletproofs::RangeProof::prove_multiple(...)
-    let mut proof_bytes = vec![];
-    proof_bytes.extend_from_slice(&amount.to_le_bytes());
-    proof_bytes.extend_from_slice(blinding);
-    // In real impl, this would be ~674 bytes for a single 64-bit range proof
+    let r_total = scalar_from_bytes(blinding)?;
+    let h = *get_h();
+
+    let mut bit_commits: Vec<Point> = Vec::with_capacity(RANGE_BITS);
+    let mut bit_blindings: Vec<Scalar> = Vec::with_capacity(RANGE_BITS);
+    let mut proof_bytes: Vec<u8> = Vec::with_capacity(RANGE_BITS * (32 * 5) + 32);
+
+    // 1. Decompose amount and commit each bit with random blinding,
+    //    except the last bit whose blinding closes the sum to r_total.
+    let mut acc_r = Scalar::ZERO;
+    let mut acc_pow = Scalar::ONE;
+    for i in 0..RANGE_BITS {
+        let bit = ((amount >> i) & 1) as u8;
+
+        let r_i = if i < RANGE_BITS - 1 {
+            let mut b = [0u8; 64]; OsRng.fill_bytes(&mut b);
+            let s = Scalar::from_bytes_mod_order_wide(&b);
+            b.zeroize();
+            // Track 2^i * r_i
+            acc_r += acc_pow * s;
+            s
+        } else {
+            // Choose last r_i so that sum_i 2^i * r_i = r_total
+            // => r_{n-1} = (r_total - acc_r) * 2^{-(n-1)}
+            let two_pow_inv = acc_pow.invert();
+            (r_total - acc_r) * two_pow_inv
+        };
+
+        let c_i = if bit == 0 { r_i * G } else { h + r_i * G };
+        bit_commits.push(c_i);
+        bit_blindings.push(r_i);
+        acc_pow *= Scalar::from(2u64);
+    }
+
+    // 2. Build per-bit OR-proofs using a Schnorr OR variant.
+    //    Proof transmits (e0, e1, s0, s1) — 4×32 bytes per bit.
+    for i in 0..RANGE_BITS {
+        let bit = ((amount >> i) & 1) as u8;
+        let c_i = bit_commits[i];
+        let r_i = bit_blindings[i];
+
+        let (e0, e1, s0, s1) = build_or_proof(bit, &c_i, &r_i, &h);
+        proof_bytes.extend_from_slice(c_i.compress().as_bytes());
+        proof_bytes.extend_from_slice(e0.as_bytes());
+        proof_bytes.extend_from_slice(e1.as_bytes());
+        proof_bytes.extend_from_slice(s0.as_bytes());
+        proof_bytes.extend_from_slice(s1.as_bytes());
+    }
+
+    // 3. Bind to the outer commitment (so verifier knows which C this proves)
+    let outer = commit(amount, blinding)?;
+    let mut tag = sha3::Sha3_256::new();
+    tag.update(b"CipherX_range_tag_v1");
+    tag.update(outer.0);
+    for c in &bit_commits {
+        tag.update(c.compress().as_bytes());
+    }
+    let tag_bytes: [u8; 32] = tag.finalize().into();
+    proof_bytes.extend_from_slice(&tag_bytes);
+
+    // Zeroize per-bit blindings
+    for s in bit_blindings.iter_mut() { s.zeroize(); }
     Some(Bulletproof(proof_bytes))
 }
 
-/// Verify a range proof.
-pub fn verify_range(
-    commitment: &PedersenCommitment,
-    proof: &Bulletproof,
-) -> bool {
-    if proof.0.len() < 40 { return false; }
-    // Stub: re-derive and check
-    // REAL impl: RangeProof::verify_multiple(...)
-    let amount = u64::from_le_bytes(proof.0[..8].try_into().unwrap_or([0u8; 8]));
-    let blinding: [u8; 32] = proof.0[8..40].try_into().unwrap_or([0u8; 32]);
-    match commit(amount, &blinding) {
-        Some(expected) => expected.0 == commitment.0,
-        None => false,
+/// Schnorr OR-proof builder for bit ∈ {0,1}.
+/// Proves: log_G(C) = r  OR  log_G(C - H) = r
+/// Returns (e0, e1, s0, s1) such that:
+///   A0 = s0*G - e0*C
+///   A1 = s1*G - e1*(C - H)
+///   e0 + e1 = H(C, A0, A1)
+fn build_or_proof(bit: u8, c: &Point, r: &Scalar, h: &Point) -> (Scalar, Scalar, Scalar, Scalar) {
+    // Random nonce for the real branch
+    let mut k = {
+        let mut b = [0u8; 64]; OsRng.fill_bytes(&mut b);
+        let s = Scalar::from_bytes_mod_order_wide(&b); b.zeroize(); s
+    };
+
+    if bit == 0 {
+        // Real branch = 0. Pick e1, s1 random for simulated branch 1.
+        let e1 = {
+            let mut b = [0u8; 64]; OsRng.fill_bytes(&mut b);
+            let s = Scalar::from_bytes_mod_order_wide(&b); b.zeroize(); s
+        };
+        let s1 = {
+            let mut b = [0u8; 64]; OsRng.fill_bytes(&mut b);
+            let s = Scalar::from_bytes_mod_order_wide(&b); b.zeroize(); s
+        };
+        let a0 = k * G;                       // real
+        let a1 = s1 * G - e1 * (*c - *h);     // simulated
+        let e_total = hash_to_scalar(&[
+            c.compress().as_bytes(),
+            a0.compress().as_bytes(),
+            a1.compress().as_bytes(),
+        ]);
+        let e0 = e_total - e1;
+        let s0 = k + e0 * r;
+        k.zeroize();
+        let result = (e0, e1, s0, s1);
+        // (e1, s1 already moved into result tuple — Scalars are Copy)
+        let _ = (e1, s1);
+        result
+    } else {
+        // Real branch = 1. Pick e0, s0 random for simulated branch 0.
+        let e0 = {
+            let mut b = [0u8; 64]; OsRng.fill_bytes(&mut b);
+            let s = Scalar::from_bytes_mod_order_wide(&b); b.zeroize(); s
+        };
+        let s0 = {
+            let mut b = [0u8; 64]; OsRng.fill_bytes(&mut b);
+            let s = Scalar::from_bytes_mod_order_wide(&b); b.zeroize(); s
+        };
+        let a0 = s0 * G - e0 * *c;            // simulated
+        let a1 = k * G;                       // real
+        let e_total = hash_to_scalar(&[
+            c.compress().as_bytes(),
+            a0.compress().as_bytes(),
+            a1.compress().as_bytes(),
+        ]);
+        let e1 = e_total - e0;
+        let s1 = k + e1 * r;
+        k.zeroize();
+        let result = (e0, e1, s0, s1);
+        let _ = (e0, s0);
+        result
     }
 }
 
-// ─── Encrypted amounts ────────────────────────────────────────────────────────
+/// Verify a range proof bound to a given commitment.
+pub fn verify_range(commitment: &PedersenCommitment, proof: &Bulletproof) -> bool {
+    let h = *get_h();
+    let per_bit = 32 * 5;
+    let expected_len = RANGE_BITS * per_bit + 32; // + tag
+    if proof.0.len() != expected_len { return false; }
+
+    let outer_pt = match CompressedRistretto(commitment.0).decompress() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let mut bit_commits: Vec<Point> = Vec::with_capacity(RANGE_BITS);
+
+    // 1. Per-bit OR-proof verification
+    let mut off = 0usize;
+    for _ in 0..RANGE_BITS {
+        let c_bytes: [u8; 32] = match proof.0[off..off+32].try_into() { Ok(b) => b, Err(_) => return false };
+        let e0_b: [u8; 32]    = match proof.0[off+32..off+64].try_into() { Ok(b) => b, Err(_) => return false };
+        let e1_b: [u8; 32]    = match proof.0[off+64..off+96].try_into() { Ok(b) => b, Err(_) => return false };
+        let s0_b: [u8; 32]    = match proof.0[off+96..off+128].try_into() { Ok(b) => b, Err(_) => return false };
+        let s1_b: [u8; 32]    = match proof.0[off+128..off+160].try_into() { Ok(b) => b, Err(_) => return false };
+        off += per_bit;
+
+        let c_i = match CompressedRistretto(c_bytes).decompress() {
+            Some(p) => p,
+            None => return false,
+        };
+        let e0 = match scalar_from_bytes(&e0_b) { Some(s) => s, None => return false };
+        let e1 = match scalar_from_bytes(&e1_b) { Some(s) => s, None => return false };
+        let s0 = match scalar_from_bytes(&s0_b) { Some(s) => s, None => return false };
+        let s1 = match scalar_from_bytes(&s1_b) { Some(s) => s, None => return false };
+
+        let a0 = s0 * G - e0 * c_i;
+        let a1 = s1 * G - e1 * (c_i - h);
+        let e_total = hash_to_scalar(&[
+            c_i.compress().as_bytes(),
+            a0.compress().as_bytes(),
+            a1.compress().as_bytes(),
+        ]);
+        if e_total != e0 + e1 { return false; }
+
+        bit_commits.push(c_i);
+    }
+
+    // 2. Verify outer-commitment binding: sum_i 2^i * C_i == outer
+    let mut acc = Point::default();
+    let mut pow = Scalar::ONE;
+    for c_i in &bit_commits {
+        acc += pow * *c_i;
+        pow *= Scalar::from(2u64);
+    }
+    if acc.compress() != outer_pt.compress() { return false; }
+
+    // 3. Verify the tag (consistency check)
+    let tag_bytes: [u8; 32] = match proof.0[off..off+32].try_into() { Ok(b) => b, Err(_) => return false };
+    let mut tag = sha3::Sha3_256::new();
+    tag.update(b"CipherX_range_tag_v1");
+    tag.update(commitment.0);
+    for c in &bit_commits {
+        tag.update(c.compress().as_bytes());
+    }
+    let expected: [u8; 32] = tag.finalize().into();
+    if expected != tag_bytes { return false; }
+
+    true
+}
+
+
+// ─── Encrypted amounts (AEAD) ─────────────────────────────────────────────────
+//
+// Encrypts u64 amounts using ChaCha20-Poly1305 with a deterministic key/nonce
+// derived from the shared secret. The Poly1305 auth tag protects against
+// tampering — without it, an attacker who learns part of the amount can
+// forge a different one (the original XOR scheme was malleable).
+//
+// Ciphertext layout: 8 bytes ciphertext || 16 bytes Poly1305 tag = 24 bytes.
+
+const AMOUNT_CT_LEN: usize = 24;
+
+fn derive_amount_key_nonce(shared_secret: &Scalar) -> ([u8; 32], [u8; 12]) {
+    let mut h = sha3::Sha3_512::new();
+    h.update(b"CipherX_amount_enc_v2");
+    h.update(shared_secret.as_bytes());
+    let out: [u8; 64] = h.finalize().into();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&out[..32]);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&out[32..44]);
+    (key, nonce)
+}
 
 /// Encrypt an amount for inclusion in tx output.
 /// Only the recipient (with view key) can decrypt.
-/// Uses ChaCha20-like XOR with shared secret (simplified — Phase 4: full AEAD).
 pub fn encrypt_amount(amount: u64, shared_secret: &Scalar) -> Vec<u8> {
-    let mut h = sha3::Sha3_256::new();
-    h.update(b"CipherX_amount_enc");
-    h.update(shared_secret.as_bytes());
-    let mask = h.finalize();
-
-    let amount_bytes = amount.to_le_bytes();
-    let mut encrypted = vec![0u8; 8];
-    for i in 0..8 {
-        encrypted[i] = amount_bytes[i] ^ mask[i];
-    }
-    encrypted
+    let (mut key_bytes, nonce_bytes) = derive_amount_key_nonce(shared_secret);
+    let key = Key::from_slice(&key_bytes);
+    let cipher = ChaCha20Poly1305::new(key);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let pt = amount.to_le_bytes();
+    let ct = cipher.encrypt(nonce, pt.as_ref())
+        .expect("ChaCha20Poly1305 encrypt failed (this should never happen for 8-byte input)");
+    key_bytes.zeroize();
+    ct
 }
 
 /// Decrypt an amount using the shared secret.
+/// Returns None on auth-tag failure (wrong key or tampered ciphertext).
 pub fn decrypt_amount(encrypted: &[u8], shared_secret: &Scalar) -> Option<u64> {
-    if encrypted.len() < 8 { return None; }
-    let mut h = sha3::Sha3_256::new();
-    h.update(b"CipherX_amount_enc");
-    h.update(shared_secret.as_bytes());
-    let mask = h.finalize();
-
-    let mut amount_bytes = [0u8; 8];
-    for i in 0..8 {
-        amount_bytes[i] = encrypted[i] ^ mask[i];
-    }
-    Some(u64::from_le_bytes(amount_bytes))
+    if encrypted.len() != AMOUNT_CT_LEN { return None; }
+    let (mut key_bytes, nonce_bytes) = derive_amount_key_nonce(shared_secret);
+    let key = Key::from_slice(&key_bytes);
+    let cipher = ChaCha20Poly1305::new(key);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let pt = cipher.decrypt(nonce, encrypted).ok();
+    key_bytes.zeroize();
+    let pt = pt?;
+    if pt.len() != 8 { return None; }
+    let mut amount = [0u8; 8];
+    amount.copy_from_slice(&pt);
+    Some(u64::from_le_bytes(amount))
 }
 
 // ─── Transaction builder helpers ──────────────────────────────────────────────
@@ -367,8 +602,9 @@ mod tests {
         let secret = { let mut bytes = [0u8; 64]; OsRng.fill_bytes(&mut bytes); Scalar::from_bytes_mod_order_wide(&bytes) };
         let wrong_secret = { let mut bytes = [0u8; 64]; OsRng.fill_bytes(&mut bytes); Scalar::from_bytes_mod_order_wide(&bytes) };
         let encrypted = encrypt_amount(amount, &secret);
-        let decrypted = decrypt_amount(&encrypted, &wrong_secret).unwrap();
-        assert_ne!(amount, decrypted);
+        // Comportement correct : mauvaise clé = échec auth
+        let result = decrypt_amount(&encrypted, &wrong_secret);
+        assert!(result.is_none(), "Une mauvaise clé doit échouer l'authentification");
     }
 
     #[test]

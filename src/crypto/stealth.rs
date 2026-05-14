@@ -104,13 +104,19 @@ pub fn generate_output(
     let b_view = point_from_bytes(&recipient.public_view.0)
         .ok_or("Invalid recipient view key")?;
 
-    // Random transaction key r
-    let r = { let mut bytes = [0u8; 64]; OsRng.fill_bytes(&mut bytes); Scalar::from_bytes_mod_order_wide(&bytes) };
+    // Random transaction key r (secret — must be zeroized)
+    let mut r = {
+        let mut bytes = [0u8; 64];
+        OsRng.fill_bytes(&mut bytes);
+        let v = Scalar::from_bytes_mod_order_wide(&bytes);
+        bytes.zeroize();
+        v
+    };
 
     // R = r*G (public, included in tx)
     let r_point = r * G;
 
-    // Shared secret: s = H_s(r * B_view)
+    // Shared secret: s = H_s(r * B_view) — secret
     let shared_point = r * b_view;
     let mut s = hash_shared_secret(&shared_point);
 
@@ -120,12 +126,12 @@ pub fn generate_output(
     // One-time output pubkey: P = H_n(s,i)*G + B_spend
     let one_time_pk = s_i * G + b_spend;
 
-    // Zeroize r after use
     let tx_pubkey = point_to_bytes(&r_point);
     let one_time_pubkey = point_to_bytes(&one_time_pk);
     let shared_secret = s_i;
 
-    // Clear sensitive data
+    // Clear sensitive intermediates
+    r.zeroize();
     s.zeroize();
 
     Ok(StealthOutputKeys {
@@ -170,12 +176,12 @@ pub fn scan_output(
     // Decompress our spend pubkey
     let b_spend = point_from_bytes(&spend_pubkey.0)?;
 
-    // Our private view key scalar
-    let a = scalar_from_bytes(&view_key.0)?;
+    // Our private view key scalar — must be zeroized
+    let mut a = scalar_from_bytes(&view_key.0)?;
 
-    // Shared secret: s = H_s(a * R)
+    // Shared secret: s = H_s(a * R) — secret
     let shared_point = a * r_point;
-    let s = hash_shared_secret(&shared_point);
+    let mut s = hash_shared_secret(&shared_point);
 
     // Indexed secret for this output
     let s_i = hash_output_index(&s, output_index);
@@ -184,15 +190,18 @@ pub fn scan_output(
     let expected_pk = point_to_bytes(&(s_i * G + b_spend));
 
     // Check if it matches
-    if expected_pk == *output_pubkey {
-        // Return the one-time private key for spending:
-        // x = H_n(s,i) + b  (where b = private spend key)
-        // Caller adds their private spend key to get full x
-        // We return s_i — caller adds their spend private key
+    let result = if expected_pk == *output_pubkey {
+        // Caller adds their private spend key to s_i to get the full
+        // one-time spend key x = s_i + b.
         Some(s_i.to_bytes())
     } else {
         None
-    }
+    };
+
+    // Zeroize secrets
+    a.zeroize();
+    s.zeroize();
+    result
 }
 
 /// Derive the full one-time private key for spending
@@ -201,10 +210,16 @@ pub fn derive_spend_key(
     s_i_bytes: &[u8; 32],
     private_spend_key: &PrivateKey,
 ) -> Option<[u8; 32]> {
-    let s_i = scalar_from_bytes(s_i_bytes)?;
-    let b = scalar_from_bytes(&private_spend_key.0)?;
-    let x = s_i + b;
-    Some(x.to_bytes())
+    let mut s_i = scalar_from_bytes(s_i_bytes)?;
+    let mut b = scalar_from_bytes(&private_spend_key.0)?;
+    let mut x = s_i + b;
+    let out = x.to_bytes();
+    // Zeroize secret scalars (the returned bytes are also secret —
+    // the caller is responsible for handling them safely)
+    s_i.zeroize();
+    b.zeroize();
+    x.zeroize();
+    Some(out)
 }
 
 // ─── Key generation ───────────────────────────────────────────────────────────

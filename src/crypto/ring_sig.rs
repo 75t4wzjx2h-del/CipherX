@@ -37,6 +37,7 @@ use sha3::{Sha3_512, Digest};
 use rand::rngs::OsRng;
 use rand_core::RngCore;
 use serde::{Serialize, Deserialize};
+use zeroize::Zeroize;
 
 use crate::core::transaction::KeyImage;
 use crate::crypto::keys::PrivateKey;
@@ -128,7 +129,7 @@ pub fn sign(
     }
 
     // Deserialize private key scalar
-    let x = scalar_from_bytes(&private_key.0)
+    let mut x = scalar_from_bytes(&private_key.0)
         .ok_or("Invalid private key scalar")?;
 
     // Decompress ring public keys
@@ -141,11 +142,26 @@ pub fn sign(
     let hp_real = hash_to_point(&ring_pubkeys[real_index]);
     let key_image: Point = x * hp_real;
 
-    // Random blinding scalar α
-    let alpha = { let mut bytes = [0u8; 64]; OsRng.fill_bytes(&mut bytes); Scalar::from_bytes_mod_order_wide(&bytes) };
+    // Random blinding scalar α — secret, must be zeroized after use
+    let mut alpha = {
+        let mut bytes = [0u8; 64];
+        OsRng.fill_bytes(&mut bytes);
+        let s = Scalar::from_bytes_mod_order_wide(&bytes);
+        bytes.zeroize();
+        s
+    };
 
-    // Random scalars for non-real ring members
-    let mut s: Vec<Scalar> = (0..n).map(|_| { let mut bytes = [0u8; 64]; OsRng.fill_bytes(&mut bytes); Scalar::from_bytes_mod_order_wide(&bytes) }).collect();
+    // Random scalars for non-real ring members. The s vector contains the
+    // closure value s[real_index] = α - c[π]·x at the end — also secret.
+    let mut s: Vec<Scalar> = (0..n)
+        .map(|_| {
+            let mut bytes = [0u8; 64];
+            OsRng.fill_bytes(&mut bytes);
+            let v = Scalar::from_bytes_mod_order_wide(&bytes);
+            bytes.zeroize();
+            v
+        })
+        .collect();
 
     // Step 1: Compute L_π = α*G,  R_π = α*H_p(P_π)
     let l_pi = alpha * G;
@@ -155,7 +171,9 @@ pub fn sign(
     let mut c = vec![Scalar::ZERO; n];
     c[(real_index + 1) % n] = hash_challenge(message, &l_pi, &r_pi);
 
-    // Step 3: Iterate around the ring (forward from π+1 to π)
+    // Step 3: Iterate around the ring (forward from π+1 to π).
+    // We use constant-time scalar multiplication via curve25519-dalek
+    // (the * operator is constant-time on Scalar/RistrettoPoint).
     let mut i = (real_index + 1) % n;
     loop {
         let hp_i = hash_to_point(&ring_pubkeys[i]);
@@ -177,6 +195,15 @@ pub fn sign(
 
     let sig = RingSignature { c0, s: s_bytes, key_image: ki_bytes };
     let ki = KeyImage(ki_bytes);
+
+    // Best-effort zeroize: scalars are Copy in curve25519-dalek so prior
+    // copies on the stack/registers cannot be guaranteed cleared, but we
+    // clear the current bindings so heap traces are reduced.
+    alpha.zeroize();
+    x.zeroize();
+    for sc in s.iter_mut() {
+        sc.zeroize();
+    }
 
     Ok((sig, ki))
 }
@@ -215,12 +242,20 @@ pub fn verify(
         None => return false,
     };
 
-    let mut c = match scalar_from_bytes(&sig.c0) {
+    let c0 = match scalar_from_bytes(&sig.c0) {
         Some(sc) => sc,
         None => return false,
     };
 
+    // Reject identity key image (would leak nothing but also be malformed).
+    // Ristretto guarantees prime-order subgroup, so any non-identity point
+    // is a valid key image.
+    if key_image == Point::default() {
+        return false;
+    }
+
     // Recompute ring
+    let mut c = c0;
     for i in 0..n {
         let hp_i = hash_to_point(&ring_pubkeys[i]);
         let l_i = s[i] * G + c * pubkeys[i];
@@ -228,8 +263,8 @@ pub fn verify(
         c = hash_challenge(message, &l_i, &r_i);
     }
 
-    // Ring closes if c == c0
-    c == scalar_from_bytes(&sig.c0).unwrap_or(Scalar::ZERO)
+    // Ring closes iff c == c0
+    c == c0
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

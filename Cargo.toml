@@ -22,7 +22,7 @@ path = "src/lib.rs"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-bincode = "1.3"
+bincode = "=1.3.3"  # Pinned to 1.x; 2.0 has breaking API changes
 
 # Crypto primitives
 sha2 = "0.10"
@@ -49,7 +49,11 @@ tokio = { version = "1.35", features = ["full"] }
 tokio-util = "0.7"
 
 # Networking / P2P
-libp2p = { version = "0.53", features = [
+# Pinned to 0.56 to pull fixed transitive deps:
+# - hickory-proto >= 0.26.1 (RUSTSEC-2026-0119 — CPU exhaustion)
+# - rustls-webpki >= 0.103.13 (RUSTSEC-2026-0098/0099/0104 — cert validation)
+# - ring >= 0.17.12 (RUSTSEC-2025-0009/0010 — AES panic, unmaintained)
+libp2p = { version = "0.56", features = [
     "tcp",
     "noise",
     "yamux",
@@ -63,7 +67,7 @@ libp2p = { version = "0.53", features = [
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 # Error handling
 thiserror = "1.0"
@@ -96,6 +100,12 @@ rpassword = "7.5"
 comfy-table = "7.1"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 dirs = "5.0"
+
+# Password-based key derivation (memory-hard)
+argon2 = "0.5"
+
+# AEAD for amount encryption (authenticated)
+chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"

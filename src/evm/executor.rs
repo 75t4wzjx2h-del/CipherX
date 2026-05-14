@@ -267,7 +267,7 @@ impl CipherXEvm {
         bytecode: Vec<u8>,
         deployer_nullifier: [u8; 32],
         deployer_nonce: u64,
-        constructor_args: Vec<u8>, // encrypted
+        _constructor_args: Vec<u8>, // encrypted (currently unused; constructor logic in Phase 5)
         gas_limit: u64,
     ) -> Result<DeployResult, ExecutionError> {
         // Validate bytecode
@@ -400,7 +400,7 @@ impl CipherXEvm {
         bytecode: &[u8],
         calldata: &[u8],
         gas_limit: u64,
-        storage: &ContractStorage,
+        _storage: &ContractStorage,  // Currently unused; will be used for revm integration in Phase 5
     ) -> RawExecResult {
         // Production impl:
         //   use revm::{EVM, db::InMemoryDB, primitives::*};
@@ -416,9 +416,9 @@ impl CipherXEvm {
         // Minimal opcode interpreter stub
         // Recognizes STOP (0x00) and RETURN (0xf3)
         let mut gas_used = 21_000u64; // base tx cost
-        let mut success = true;
+        let success = true;
         let mut output = vec![];
-        let mut storage_changes = vec![];
+        let storage_changes = vec![];
 
         if bytecode.is_empty() {
             return RawExecResult {
@@ -489,7 +489,7 @@ impl CipherXEvm {
     fn encrypt_storage_changes(
         &self,
         changes: &[([u8; 32], [u8; 32])],
-        contract_key: &[u8; 32],
+        _contract_key: &[u8; 32],  // Currently unused; encryption to be implemented in Phase 5
     ) -> Vec<StorageSlot> {
         changes.iter().map(|(k, v)| {
             // TODO: encrypt v with contract_key

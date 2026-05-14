@@ -17,11 +17,10 @@
 //   // Verify a ring signature
 //   (bool ok) = address(0x100).call(abi.encode(message, ring_members, signature));
 
-use serde::{Serialize, Deserialize};
 use sha3::{Keccak256, Digest};
 
 use crate::crypto::ring_sig::verify_ring;
-use crate::crypto::ringct::{verify_range, verify_balance};
+use crate::crypto::ringct::verify_range;
 use crate::core::transaction::{PedersenCommitment, Bulletproof, KeyImage};
 use super::gas::GasCost;
 
@@ -144,21 +143,12 @@ fn precompile_zk_verify(input: &[u8], gas_limit: u64) -> PrecompileResult {
         return PrecompileResult::err(gas);
     }
 
-    let nullifier: [u8; 32] = input[0..32].try_into().unwrap_or([0u8; 32]);
-    let epoch = u64::from_be_bytes(input[32..40].try_into().unwrap_or([0u8; 8]));
-    let proof_bytes = input[40..].to_vec();
+    let _nullifier: [u8; 32] = input[0..32].try_into().unwrap_or([0u8; 32]);
+    let _epoch = u64::from_be_bytes(input[32..40].try_into().unwrap_or([0u8; 8]));
+    let proof_bytes = &input[40..];
 
-    // Build StakeProof and verify
-    let proof = crate::crypto::zk::StakeProof {
-        proof_bytes,
-        nullifier,
-        epoch,
-    };
-
-    // Note: verifying key must be accessible from chain state
-    // In production: pass VK from chain config
-    // For now: return true if proof is non-empty (stub)
-    let valid = !proof.proof_bytes.is_empty();
+    // zk module removed; stub returns true if proof bytes non-empty
+    let valid = !proof_bytes.is_empty();
 
     let mut output = vec![0u8; 32];
     if valid { output[31] = 1; }
