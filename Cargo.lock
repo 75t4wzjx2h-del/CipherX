@@ -821,6 +821,7 @@ dependencies = [
  "qrcode",
  "rand 0.8.6",
  "rand_core 0.6.4",
+ "rayon",
  "reqwest",
  "rocksdb",
  "rpassword",

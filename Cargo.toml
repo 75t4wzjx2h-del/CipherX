@@ -48,6 +48,9 @@ rocksdb = "0.21"
 tokio = { version = "1.35", features = ["full"] }
 tokio-util = "0.7"
 
+# Parallelism (ring sig verification, range proofs)
+rayon = "1.8"
+
 # Networking / P2P
 # Pinned to 0.56 to pull fixed transitive deps:
 # - hickory-proto >= 0.26.1 (RUSTSEC-2026-0119 — CPU exhaustion)

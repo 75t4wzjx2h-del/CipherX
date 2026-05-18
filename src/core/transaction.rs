@@ -91,31 +91,23 @@ impl Transaction {
         verify_balance(&inputs, &outputs, &self.fee_commitment)
     }
 
-    /// Verify all ring signatures
+    /// Verify all ring signatures (parallel over inputs via rayon)
     pub fn verify_ring_signatures(&self) -> bool {
         use crate::crypto::ring_sig::verify_ring;
+        use rayon::prelude::*;
         let msg = self.commitment_hash();
-        for input in &self.inputs {
-            let ok = verify_ring(
-                &msg,
-                &input.ring_members,
-                &input.ring_signature,
-                &input.key_image,
-            );
-            if !ok { return false; }
-        }
-        true
+        self.inputs.par_iter().all(|input| {
+            verify_ring(&msg, &input.ring_members, &input.ring_signature, &input.key_image)
+        })
     }
 
-    /// Verify all bulletproofs (range proofs)
+    /// Verify all bulletproofs (parallel over outputs via rayon)
     pub fn verify_range_proofs(&self) -> bool {
         use crate::crypto::ringct::verify_range;
-        for output in &self.outputs {
-            if !verify_range(&output.amount_commitment, &output.range_proof) {
-                return false;
-            }
-        }
-        true
+        use rayon::prelude::*;
+        self.outputs.par_iter().all(|output| {
+            verify_range(&output.amount_commitment, &output.range_proof)
+        })
     }
 
     pub fn verify(&self) -> bool {

@@ -178,10 +178,10 @@ impl Block {
         self.transactions.len()
     }
 
-    /// Block size in bytes (approximate)
+    /// Block size in bytes (no allocation — uses serialized_size)
     pub fn byte_size(&self) -> usize {
-        bincode::serialize(self)
-            .map(|b| b.len())
+        bincode::serialized_size(self)
+            .map(|n| n as usize)
             .unwrap_or(0)
     }
 }

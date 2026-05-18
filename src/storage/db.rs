@@ -7,7 +7,7 @@
 //   chain_state      — "height" / "tip" → values
 //   validators       — nullifier → bincode(validator data)
 
-use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
+use rocksdb::{DB, Options, BlockBasedOptions, DBCompressionType, ColumnFamilyDescriptor, WriteBatch};
 
 use crate::core::block::{Block, BlockHash};
 
@@ -30,10 +30,26 @@ impl CipherXDb {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
+        // Key images CF: bloom filter for O(1) double-spend lookups at scale
+        let key_images_opts = {
+            let mut bb = BlockBasedOptions::default();
+            bb.set_bloom_filter(10.0, false);
+            let mut o = Options::default();
+            o.set_block_based_table_factory(&bb);
+            o
+        };
+
+        // Blocks CF: Snappy compression (blocks are large, compress well)
+        let blocks_opts = {
+            let mut o = Options::default();
+            o.set_compression_type(DBCompressionType::Snappy);
+            o
+        };
+
         let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_BLOCKS_BY_HASH,   Options::default()),
+            ColumnFamilyDescriptor::new(CF_BLOCKS_BY_HASH,   blocks_opts),
             ColumnFamilyDescriptor::new(CF_BLOCKS_BY_HEIGHT, Options::default()),
-            ColumnFamilyDescriptor::new(CF_KEY_IMAGES,       Options::default()),
+            ColumnFamilyDescriptor::new(CF_KEY_IMAGES,       key_images_opts),
             ColumnFamilyDescriptor::new(CF_CHAIN_STATE,      Options::default()),
             ColumnFamilyDescriptor::new(CF_VALIDATORS,       Options::default()),
         ];

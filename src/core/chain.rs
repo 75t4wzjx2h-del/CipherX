@@ -9,6 +9,7 @@
 //   - Staking lock period (adaptive exit queue)
 
 use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
 use thiserror::Error;
 use tracing::info;
 
@@ -230,12 +231,24 @@ impl Chain {
             }
         }
 
-        // 4. Validate all transactions
+        // 4. Within-block key image uniqueness (sequential, cheap, enables safe parallel step)
+        let mut block_key_images: HashSet<[u8; 32]> = HashSet::new();
         for tx in &block.transactions {
-            self.validate_transaction(tx)?;
+            for input in &tx.inputs {
+                if !block_key_images.insert(input.key_image.0) {
+                    return Err(ChainError::DoubleSpend(
+                        format!("within-block: {}", hex::encode(input.key_image.0))
+                    ));
+                }
+            }
         }
 
-        // 4. Apply block to state
+        // 5. Validate all transactions — parallel crypto verification
+        let chain_ref: &Self = self;
+        block.transactions.par_iter()
+            .try_for_each(|tx| chain_ref.validate_transaction(tx))?;
+
+        // 6. Apply block to state
         let block_hash = block.hash();
         self.apply_block(&block)?;
 

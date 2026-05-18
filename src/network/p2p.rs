@@ -180,28 +180,34 @@ impl Default for P2PConfig {
 struct MessageCache {
     seen: HashMap<[u8; 32], Instant>,
     max_age: Duration,
+    inserts_since_evict: u32,
 }
 
 impl MessageCache {
+    const EVICT_EVERY: u32 = 128;
+
     fn new(max_age_ms: u64) -> Self {
         MessageCache {
             seen: HashMap::new(),
             max_age: Duration::from_millis(max_age_ms),
+            inserts_since_evict: 0,
         }
     }
 
-    /// Returns true if this message is new (not seen before)
+    /// Returns true if this message is new (not seen before).
+    /// Evicts stale entries every 128 inserts instead of on every call.
     fn insert(&mut self, id: [u8; 32]) -> bool {
-        let now = Instant::now();
-        // Evict old entries
-        self.seen.retain(|_, t| now.duration_since(*t) < self.max_age);
-        // Insert new
         if self.seen.contains_key(&id) {
-            false
-        } else {
-            self.seen.insert(id, now);
-            true
+            return false;
         }
+        let now = Instant::now();
+        self.inserts_since_evict += 1;
+        if self.inserts_since_evict >= Self::EVICT_EVERY {
+            self.inserts_since_evict = 0;
+            self.seen.retain(|_, t| now.duration_since(*t) < self.max_age);
+        }
+        self.seen.insert(id, now);
+        true
     }
 }
 
