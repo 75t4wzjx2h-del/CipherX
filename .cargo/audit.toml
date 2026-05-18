@@ -1,0 +1,28 @@
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2 — RUSTSEC-2026-0118, RUSTSEC-2026-0119
+    # Pulled by libp2p-mdns 0.48.0 which requires exactly hickory-proto 0.25.2.
+    # libp2p-mdns is an OPTIONAL dep of libp2p 0.56 (feature "mdns") and is NOT
+    # enabled in CipherX (see Cargo.toml features list). Never compiled into binaries.
+    # Upstream fix requires libp2p-mdns > 0.48.0 to relax the hickory-proto pin.
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+
+    # tracing-subscriber 0.2.25 — RUSTSEC-2025-0055 (ANSI escape injection in logs)
+    # Pulled by ark-relations 0.4.0 (ZK-SNARK circuit library, version "0.2" pinned upstream).
+    # Exploitable only when user-controlled strings are passed to tracing macros.
+    # CipherX does not log user input through ark-relations (used for internal ZK proofs only).
+    # Fix requires ark-relations to upgrade to tracing-subscriber 0.3.x (upstream issue).
+    "RUSTSEC-2025-0055",
+
+    # bincode 1.3.3 — RUSTSEC-2025-0141 (unmaintained advisory, not a CVE)
+    # Intentionally pinned to 1.x. bincode 2.x has breaking API changes incompatible
+    # with existing serialization. Migration planned when API stabilizes.
+    "RUSTSEC-2025-0141",
+
+    # derivative 2.2.0 — RUSTSEC-2024-0388 (unmaintained)
+    # paste 1.0.15 — RUSTSEC-2024-0436 (unmaintained)
+    # Both pulled by ark-* ZK crates. No known exploitable vulnerability.
+    "RUSTSEC-2024-0388",
+    "RUSTSEC-2024-0436",
+]
