@@ -213,7 +213,24 @@ impl Chain {
             return Err(ChainError::InvalidPrevHash);
         }
 
-        // 3. Validate all transactions
+        // 3. Validate coinbase structure: at most one, must be first, only validator may include it
+        let coinbase_count = block.transactions.iter()
+            .filter(|tx| tx.tx_type == TxType::Coinbase)
+            .count();
+        if coinbase_count > 1 {
+            return Err(ChainError::InvalidTransaction(
+                "block contains more than one coinbase transaction".to_string()
+            ));
+        }
+        if coinbase_count == 1 {
+            if block.transactions.first().map(|tx| tx.tx_type != TxType::Coinbase).unwrap_or(true) {
+                return Err(ChainError::InvalidTransaction(
+                    "coinbase must be the first transaction in a block".to_string()
+                ));
+            }
+        }
+
+        // 4. Validate all transactions
         for tx in &block.transactions {
             self.validate_transaction(tx)?;
         }
@@ -274,10 +291,13 @@ impl Chain {
                 self.utxo_set.insert((tx_id.clone(), idx as u32), entry);
             }
 
-            // Update supply for coinbase
+            // Update supply for coinbase, respecting hard cap
             if tx.tx_type == TxType::Coinbase {
                 let reward = ChainParams::block_reward(block.header.height);
-                self.circulating_supply += reward;
+                let max_ncip = ChainParams::MAX_SUPPLY * 1_000_000_000;
+                self.circulating_supply = self.circulating_supply
+                    .saturating_add(reward)
+                    .min(max_ncip);
             }
         }
 
