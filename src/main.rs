@@ -14,7 +14,7 @@ use cipherx::crypto::keys::{ValidatorCommitment, StealthAddress, PublicKey};
 use cipherx::network::tor::{TorClient, TorConfig};
 use cipherx::network::p2p::{P2PNode, P2PConfig, NetworkEvent};
 use cipherx::network::sync::SyncState;
-use cipherx::network::rpc::{RpcRequest, NodeState, handle_request};
+use cipherx::network::rpc::{RpcRequest, NodeState, BlockOutputRef, handle_request};
 use cipherx::network::p2p::{NetworkMessage, HelloMessage, BlockRequest, BlockResponse};
 use cipherx::network::sync_protocol::{send_msg, recv_msg, PROTOCOL_VERSION, BLOCKS_PER_BATCH};
 use tokio::sync::broadcast;
@@ -344,6 +344,15 @@ async fn run_rpc_server(chain: Arc<RwLock<Chain>>, peer_count: Arc<AtomicUsize>)
             let state = {
                 let c = chain_c.read().await;
                 let s = c.stats();
+                let block_outputs = c.all_utxos().into_iter().map(|u| BlockOutputRef {
+                    tx_pubkey:        hex::encode(u.output.tx_pubkey),
+                    one_time_pubkey:  hex::encode(u.output.one_time_pubkey),
+                    amount_commitment: hex::encode(u.output.amount_commitment.0),
+                    encrypted_amount: hex::encode(&u.output.encrypted_amount),
+                    output_index:     u.output_index,
+                    tx_id:            hex::encode(u.tx_id.0),
+                    block_height:     u.block_height,
+                }).collect();
                 NodeState {
                     chain_height: s.height,
                     tip_hash: [0u8; 32],
@@ -353,7 +362,7 @@ async fn run_rpc_server(chain: Arc<RwLock<Chain>>, peer_count: Arc<AtomicUsize>)
                     base_fee_per_gas: 0,
                     circulating_supply_ncip: s.circulating_supply_cip * 1_000_000_000,
                     block_reward_ncip: s.next_block_reward_cip * 1_000_000_000,
-                    block_outputs: vec![],
+                    block_outputs,
                 }
             };
 

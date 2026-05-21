@@ -330,6 +330,11 @@ impl Chain {
         )
     }
 
+    /// All unspent outputs — for RPC wallet scanning (commitment-level only, no private data)
+    pub fn all_utxos(&self) -> Vec<&UtxoEntry> {
+        self.utxo_set.values().collect()
+    }
+
     /// Chain stats (for node dashboard — no private info)
     pub fn stats(&self) -> ChainStats {
         ChainStats {
