@@ -74,6 +74,26 @@ pub const ERR_UNAUTHORIZED: i32 = -32001; // e.g. wrong view key
 
 // ─── RPC handler ─────────────────────────────────────────────────────────────
 
+/// Public output reference — commitment-level data only (no private amounts).
+/// Passed to RPC handlers so wallet clients can scan for their outputs.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockOutputRef {
+    /// R = tx_pubkey (hex) — for stealth scanning
+    pub tx_pubkey: String,
+    /// P = one_time_pubkey (hex) — tested by recipient
+    pub one_time_pubkey: String,
+    /// Pedersen commitment C = v*H + r*G (hex)
+    pub amount_commitment: String,
+    /// AEAD-encrypted amount (hex) — decryptable by recipient only
+    pub encrypted_amount: String,
+    /// Output index within the transaction
+    pub output_index: u32,
+    /// Transaction ID (hex)
+    pub tx_id: String,
+    /// Block height
+    pub block_height: u64,
+}
+
 /// Node state accessible to RPC handlers
 pub struct NodeState {
     pub chain_height: u64,
@@ -84,6 +104,8 @@ pub struct NodeState {
     pub base_fee_per_gas: u64,
     pub circulating_supply_ncip: u64,
     pub block_reward_ncip: u64,
+    /// All outputs seen so far (commitment-level — no private data)
+    pub block_outputs: Vec<BlockOutputRef>,
 }
 
 /// Handle a single RPC request
@@ -91,7 +113,9 @@ pub fn handle_request(request: &RpcRequest, state: &NodeState) -> RpcResponse {
     let id = request.id.clone();
     match request.method.as_str() {
         "cipherx_blockNumber"        => rpc_block_number(id, state),
+        "cipherx_getBlockCount"      => rpc_get_block_count(id, state),
         "cipherx_getBlock"           => rpc_get_block(id, &request.params, state),
+        "cipherx_getOutputs"         => rpc_get_outputs(id, &request.params, state),
         "cipherx_gasPrice"           => rpc_gas_price(id, state),
         "cipherx_syncStatus"         => rpc_sync_status(id, state),
         "cipherx_peerCount"          => rpc_peer_count(id, state),
@@ -110,6 +134,11 @@ fn rpc_block_number(id: Value, state: &NodeState) -> RpcResponse {
     RpcResponse::ok(id, json!(format!("0x{:x}", state.chain_height)))
 }
 
+/// cipherx_getBlockCount — returns current chain height as a plain integer
+fn rpc_get_block_count(id: Value, state: &NodeState) -> RpcResponse {
+    RpcResponse::ok(id, json!(state.chain_height))
+}
+
 fn rpc_get_block(id: Value, params: &[Value], state: &NodeState) -> RpcResponse {
     let height = match params.first().and_then(|v| v.as_u64()) {
         Some(h) => h,
@@ -120,14 +149,66 @@ fn rpc_get_block(id: Value, params: &[Value], state: &NodeState) -> RpcResponse 
         return RpcResponse::err(id, ERR_NOT_FOUND, format!("Block {} not found", height));
     }
 
-    // Return minimal block info (no private data)
+    // Return block info with outputs (commitments only — no private data)
+    // In production this would look up the actual block from storage.
+    // For now we return the commitment-level data that the node has.
+    let outputs_json: Vec<Value> = state.block_outputs.iter()
+        .filter(|o| o.block_height == height)
+        .map(|o| json!({
+            "tx_pubkey":       o.tx_pubkey,
+            "one_time_pubkey": o.one_time_pubkey,
+            "amount_commitment": o.amount_commitment,
+            "encrypted_amount":  o.encrypted_amount,
+            "output_index":      o.output_index,
+            "tx_id":             o.tx_id,
+            "block_height":      o.block_height,
+        }))
+        .collect();
+
     RpcResponse::ok(id, json!({
-        "height": height,
-        "hash": hex::encode(state.tip_hash), // simplified
+        "height":    height,
+        "hash":      hex::encode(state.tip_hash), // simplified
         "timestamp": chrono::Utc::now().timestamp(),
-        "txCount": 0,  // real impl: look up block
-        "size": 0,
+        "txCount":   if outputs_json.is_empty() { 0 } else { 1 },
+        "outputs":   outputs_json,
     }))
+}
+
+/// cipherx_getOutputs(from, to) — returns all stealth outputs in the block range [from, to].
+/// Only commitment-level data is returned (no private amounts).
+/// The wallet uses its view key to test each output locally.
+fn rpc_get_outputs(id: Value, params: &[Value], state: &NodeState) -> RpcResponse {
+    let from = match params.first().and_then(|v| v.as_u64()) {
+        Some(h) => h,
+        None => return RpcResponse::err(id, ERR_PARAMS, "Expected from height".to_string()),
+    };
+    let to = match params.get(1).and_then(|v| v.as_u64()) {
+        Some(h) => h,
+        None => return RpcResponse::err(id, ERR_PARAMS, "Expected to height".to_string()),
+    };
+
+    if from > to {
+        return RpcResponse::err(id, ERR_PARAMS, "from must be <= to".to_string());
+    }
+    if to > state.chain_height {
+        return RpcResponse::err(id, ERR_NOT_FOUND,
+            format!("Block {} not yet available (current height: {})", to, state.chain_height));
+    }
+
+    let outputs: Vec<Value> = state.block_outputs.iter()
+        .filter(|o| o.block_height >= from && o.block_height <= to)
+        .map(|o| json!({
+            "tx_pubkey":        o.tx_pubkey,
+            "one_time_pubkey":  o.one_time_pubkey,
+            "amount_commitment": o.amount_commitment,
+            "encrypted_amount": o.encrypted_amount,
+            "output_index":     o.output_index,
+            "tx_id":            o.tx_id,
+            "block_height":     o.block_height,
+        }))
+        .collect();
+
+    RpcResponse::ok(id, json!(outputs))
 }
 
 fn rpc_gas_price(id: Value, state: &NodeState) -> RpcResponse {
@@ -173,7 +254,7 @@ fn rpc_chain_id(id: Value) -> RpcResponse {
     // CipherX chain ID — unique to avoid replay attacks from other EVM chains
     // Choose a value not used by any existing chain
     // https://chainlist.org — pick something unique
-    RpcResponse::ok(id, json!("0x434950")) // "CIP" in hex
+    RpcResponse::ok(id, json!("0x43495054")) // "CIPT" — CipherX IP Testnet
 }
 
 fn rpc_protocol_version(id: Value) -> RpcResponse {
@@ -214,6 +295,7 @@ mod tests {
             base_fee_per_gas: 1000,
             circulating_supply_ncip: 4_100_000_000_000,
             block_reward_ncip: 50_000_000_000,
+            block_outputs: vec![],
         }
     }
 
@@ -281,12 +363,59 @@ mod tests {
     fn test_chain_id() {
         let r = handle_request(&req("cipherx_chainId", vec![]), &state());
         assert!(r.error.is_none());
-        assert_eq!(r.result.unwrap(), json!("0x434950"));
+        assert_eq!(r.result.unwrap(), json!("0x43495054"));
     }
 
     #[test]
     fn test_tx_status_no_params_fails() {
         let r = handle_request(&req("cipherx_getTxStatus", vec![]), &state());
         assert!(r.error.is_some());
+    }
+
+    #[test]
+    fn test_get_block_count() {
+        let r = handle_request(&req("cipherx_getBlockCount", vec![]), &state());
+        assert!(r.error.is_none());
+        assert_eq!(r.result.unwrap(), json!(42u64));
+    }
+
+    #[test]
+    fn test_get_outputs_empty() {
+        let r = handle_request(&req("cipherx_getOutputs", vec![json!(0u64), json!(10u64)]), &state());
+        assert!(r.error.is_none());
+        assert_eq!(r.result.unwrap(), json!([]));
+    }
+
+    #[test]
+    fn test_get_outputs_missing_params() {
+        let r = handle_request(&req("cipherx_getOutputs", vec![json!(0u64)]), &state());
+        assert!(r.error.is_some());
+        assert_eq!(r.error.unwrap().code, ERR_PARAMS);
+    }
+
+    #[test]
+    fn test_get_outputs_future_block_fails() {
+        let r = handle_request(&req("cipherx_getOutputs", vec![json!(0u64), json!(9999u64)]), &state());
+        assert!(r.error.is_some());
+        assert_eq!(r.error.unwrap().code, ERR_NOT_FOUND);
+    }
+
+    #[test]
+    fn test_get_outputs_with_data() {
+        let mut s = state();
+        s.block_outputs.push(BlockOutputRef {
+            tx_pubkey: "aabb".to_string(),
+            one_time_pubkey: "ccdd".to_string(),
+            amount_commitment: "eeff".to_string(),
+            encrypted_amount: "1122".to_string(),
+            output_index: 0,
+            tx_id: "deadbeef".to_string(),
+            block_height: 5,
+        });
+        let r = handle_request(&req("cipherx_getOutputs", vec![json!(1u64), json!(10u64)]), &s);
+        assert!(r.error.is_none());
+        let arr = r.result.unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 1);
+        assert_eq!(arr[0]["block_height"], json!(5u64));
     }
 }

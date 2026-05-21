@@ -16,6 +16,11 @@ use tracing::info;
 use crate::core::block::{Block, BlockHash};
 use crate::core::transaction::{Transaction, TxId, TxType, StealthOutput, PedersenCommitment};
 
+/// CipherX testnet identity
+pub const CHAIN_ID: u64 = 0x43495054; // "CIPT" — CipherX IP Testnet
+pub const NETWORK_NAME: &str = "CipherX Testnet";
+pub const IS_TESTNET: bool = true;
+
 /// CipherX network constants
 pub struct ChainParams;
 
