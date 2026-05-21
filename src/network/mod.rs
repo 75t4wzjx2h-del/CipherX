@@ -15,3 +15,4 @@ pub mod p2p;
 pub mod rpc;
 pub mod sync;
 pub mod peer;
+pub mod sync_protocol;

@@ -15,6 +15,11 @@ use cipherx::network::tor::{TorClient, TorConfig};
 use cipherx::network::p2p::{P2PNode, P2PConfig, NetworkEvent};
 use cipherx::network::sync::SyncState;
 use cipherx::network::rpc::{RpcRequest, NodeState, handle_request};
+use cipherx::network::p2p::{NetworkMessage, HelloMessage, BlockRequest, BlockResponse};
+use cipherx::network::sync_protocol::{send_msg, recv_msg, PROTOCOL_VERSION, BLOCKS_PER_BATCH};
+use tokio::sync::broadcast;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,11 +64,39 @@ async fn main() -> anyhow::Result<()> {
     // ── Reward address ────────────────────────────────────────────────────
     let reward_address = load_reward_address();
 
-    info!("🔐 Consensus Tendermint BFT — mode solo");
+    // ── Mode détection ────────────────────────────────────────────────────
+    let seed_nodes: Vec<String> = std::env::var("CIPHERX_SEED_NODES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let is_sync_mode = !seed_nodes.is_empty();
+
+    if is_sync_mode {
+        info!("🔄 Mode SYNC — seed: {:?}", seed_nodes);
+        info!("   (pas de production de blocs — sync depuis le seed)");
+    } else {
+        info!("🔐 Mode VALIDATEUR — Tendermint BFT solo");
+    }
+
+    // ── Broadcast channel (new blocks → connected peers) ──────────────────
+    let (block_bcast_tx, _) = broadcast::channel::<Block>(128);
+
+    // ── Sync channel (blocks reçus du seed → main loop) ───────────────────
+    let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel::<Block>(256);
+
+    // ── Peer counter (pour RPC peerCount) ─────────────────────────────────
+    let peer_count = Arc::new(AtomicUsize::new(0));
 
     // ── RPC + P2P servers ─────────────────────────────────────────────────
-    tokio::spawn(run_rpc_server(chain.clone()));
-    tokio::spawn(run_p2p_listener());
+    tokio::spawn(run_rpc_server(chain.clone(), peer_count.clone()));
+    tokio::spawn(run_p2p_listener(chain.clone(), block_bcast_tx.clone(), peer_count.clone()));
+
+    // ── Connexion aux seeds (mode sync uniquement) ─────────────────────────
+    for seed in seed_nodes {
+        tokio::spawn(run_sync_client(seed, chain.clone(), sync_tx.clone()));
+    }
 
     info!("✅ Nœud CipherX Lite prêt\n");
 
@@ -74,10 +107,26 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
+            // ── Bloc reçu du seed (mode sync) ─────────────────────────────
+            Some(block) = sync_rx.recv() => {
+                let mut chain_w = chain.write().await;
+                match chain_w.append_block(block) {
+                    Ok(()) => {
+                        let s = chain_w.stats();
+                        sync.on_block_applied(s.height);
+                        info!("📥 Bloc #{} appliqué | supply: {} CIP", s.height, s.circulating_supply_cip);
+                    }
+                    Err(e) => {
+                        // Peut arriver si le bloc est déjà connu (reconnexion)
+                        tracing::debug!("Bloc ignoré: {}", e);
+                    }
+                }
+            }
+
+            // ── Événements réseau ──────────────────────────────────────────
             Some(event) = event_rx.recv() => {
                 match event {
                     NetworkEvent::BlockReceived { block, from: _ } => {
-                        info!("📥 Bloc #{} reçu", block.header.height);
                         sync.on_block_applied(block.header.height);
                     }
                     NetworkEvent::VoteReceived { vote, from: _ } => {
@@ -88,19 +137,16 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     NetworkEvent::PeerConnected(info) => {
-                        info!("👤 Pair connecté (hauteur={})", info.height);
                         sync.update_target(info.height,
                             cipherx::network::peer::PeerId([0u8; 32]));
-                    }
-                    NetworkEvent::PeerDisconnected(_) => {
-                        info!("👋 Pair déconnecté");
                     }
                     _ => {}
                 }
             }
 
+            // ── Tick consensus (mode validateur uniquement) ────────────────
             _ = tick.tick() => {
-                if consensus.is_proposer() {
+                if !is_sync_mode && consensus.is_proposer() {
                     let (next_height, prev_hash) = {
                         let c = chain.read().await;
                         (c.height + 1, c.tip_hash.clone())
@@ -123,6 +169,8 @@ async fn main() -> anyhow::Result<()> {
                                 drop(chain_w);
                                 consensus.start_height(next_height + 1);
                                 let _ = p2p.broadcast_block(&finalized).await;
+                                // Diffuse aux pairs connectés
+                                let _ = block_bcast_tx.send(finalized);
                             }
                             Err(e) => {
                                 info!("❌ Bloc rejeté: {}", e);
@@ -256,7 +304,7 @@ fn drive_solo_consensus(engine: &mut TendermintEngine, block: Block) -> Option<B
 }
 
 /// Minimal HTTP JSON-RPC server on 127.0.0.1:8545
-async fn run_rpc_server(chain: Arc<RwLock<Chain>>) {
+async fn run_rpc_server(chain: Arc<RwLock<Chain>>, peer_count: Arc<AtomicUsize>) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -268,6 +316,7 @@ async fn run_rpc_server(chain: Arc<RwLock<Chain>>) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else { continue };
         let chain_c = chain.clone();
+        let pc = peer_count.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 32768];
             let n = match stream.read(&mut buf).await { Ok(n) => n, Err(_) => return };
@@ -275,7 +324,6 @@ async fn run_rpc_server(chain: Arc<RwLock<Chain>>) {
 
             let raw = String::from_utf8_lossy(&buf[..n]);
 
-            // Handle CORS preflight
             if raw.starts_with("OPTIONS") {
                 let cors = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n";
                 let _ = stream.write_all(cors.as_bytes()).await;
@@ -299,7 +347,7 @@ async fn run_rpc_server(chain: Arc<RwLock<Chain>>) {
                 NodeState {
                     chain_height: s.height,
                     tip_hash: [0u8; 32],
-                    peer_count: 0,
+                    peer_count: pc.load(Ordering::Relaxed),
                     syncing: false,
                     sync_progress: 1.0,
                     base_fee_per_gas: 0,
@@ -320,8 +368,12 @@ async fn run_rpc_server(chain: Arc<RwLock<Chain>>) {
     }
 }
 
-/// TCP listener on 0.0.0.0:9152 (P2P — accepts connections from peers)
-async fn run_p2p_listener() {
+/// TCP listener on 0.0.0.0:9152 — accepts peers, runs full sync protocol
+async fn run_p2p_listener(
+    chain: Arc<RwLock<Chain>>,
+    block_bcast: broadcast::Sender<Block>,
+    peer_count: Arc<AtomicUsize>,
+) {
     use tokio::net::TcpListener;
 
     let listener = match TcpListener::bind("0.0.0.0:9152").await {
@@ -331,12 +383,178 @@ async fn run_p2p_listener() {
 
     loop {
         match listener.accept().await {
-            Ok((_stream, addr)) => {
-                info!("👤 P2P inbound connection from {}", addr);
-                // Full libp2p handshake is a future milestone
+            Ok((stream, addr)) => {
+                let chain_c = chain.clone();
+                let bcast_rx = block_bcast.subscribe();
+                let pc = peer_count.clone();
+                tokio::spawn(handle_peer_inbound(stream, addr, chain_c, bcast_rx, pc));
             }
             Err(e) => { info!("P2P accept error: {}", e); }
         }
+    }
+}
+
+/// Handle one inbound peer connection end-to-end
+async fn handle_peer_inbound(
+    mut stream: tokio::net::TcpStream,
+    addr: SocketAddr,
+    chain: Arc<RwLock<Chain>>,
+    mut bcast_rx: broadcast::Receiver<Block>,
+    peer_count: Arc<AtomicUsize>,
+) {
+    // ── Handshake ──────────────────────────────────────────────────────────
+    let our_height = chain.read().await.height;
+    let hello = NetworkMessage::Hello(HelloMessage {
+        version: PROTOCOL_VERSION.to_string(),
+        height: our_height,
+        tip_hash: [0u8; 32],
+        protocols: vec!["/cipherx/sync/1.0.0".to_string()],
+        onion_address: None,
+    });
+    if send_msg(&mut stream, &hello).await.is_err() { return; }
+
+    let peer_height = match recv_msg(&mut stream).await {
+        Ok(NetworkMessage::Hello(h)) => h.height,
+        _ => return,
+    };
+    info!("👤 Pair {} connecté (hauteur={})", addr, peer_height);
+    peer_count.fetch_add(1, Ordering::Relaxed);
+
+    // ── Main loop: serve requests + push new blocks ────────────────────────
+    loop {
+        tokio::select! {
+            msg = recv_msg(&mut stream) => {
+                match msg {
+                    Ok(NetworkMessage::BlockRequest(req)) => {
+                        let blocks: Vec<Block> = {
+                            let c = chain.read().await;
+                            let end = req.to_height.min(c.height);
+                            (req.from_height..=end)
+                                .take(BLOCKS_PER_BATCH as usize)
+                                .filter_map(|h| c.block_at(h).cloned())
+                                .collect()
+                        };
+                        let count = blocks.len();
+                        let resp = NetworkMessage::BlockResponse(BlockResponse {
+                            request_id: req.request_id,
+                            blocks,
+                        });
+                        if send_msg(&mut stream, &resp).await.is_err() { break; }
+                        info!("📤 {} blocs envoyés à {} (#{}-#{})", count, addr, req.from_height, req.to_height);
+                    }
+                    Ok(NetworkMessage::Bye) | Err(_) => break,
+                    _ => {}
+                }
+            }
+
+            // Push new blocks to this peer as they are produced
+            result = bcast_rx.recv() => {
+                match result {
+                    Ok(block) => {
+                        let msg = NetworkMessage::NewBlock(Box::new(block));
+                        if send_msg(&mut stream, &msg).await.is_err() { break; }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        info!("⚠️  Pair {} en retard de {} blocs — sync nécessaire", addr, n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    peer_count.fetch_sub(1, Ordering::Relaxed);
+    info!("👋 Pair {} déconnecté", addr);
+}
+
+/// Connect to a seed node, sync all missing blocks, then stay connected for live blocks.
+/// Used by tester nodes: set CIPHERX_SEED_NODES=141.11.243.5:9152
+async fn run_sync_client(
+    seed_addr: String,
+    chain: Arc<RwLock<Chain>>,
+    sync_tx: tokio::sync::mpsc::Sender<Block>,
+) {
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, Duration};
+
+    loop {
+        info!("🔗 Connexion au seed node {}...", seed_addr);
+        let mut stream = match TcpStream::connect(&seed_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                info!("❌ Connexion impossible à {} : {} — retry dans 10s", seed_addr, e);
+                sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+
+        // ── Handshake ──────────────────────────────────────────────────────
+        let our_height = chain.read().await.height;
+        let hello = NetworkMessage::Hello(HelloMessage {
+            version: PROTOCOL_VERSION.to_string(),
+            height: our_height,
+            tip_hash: [0u8; 32],
+            protocols: vec!["/cipherx/sync/1.0.0".to_string()],
+            onion_address: None,
+        });
+        if send_msg(&mut stream, &hello).await.is_err() {
+            sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        let seed_height = match recv_msg(&mut stream).await {
+            Ok(NetworkMessage::Hello(h)) => h.height,
+            _ => { sleep(Duration::from_secs(5)).await; continue; }
+        };
+        info!("✅ Seed connecté — leur hauteur: #{}, la nôtre: #{}", seed_height, our_height);
+
+        // ── Catch-up sync ──────────────────────────────────────────────────
+        let mut next = chain.read().await.height + 1;
+        let mut req_id: u64 = 0;
+
+        while next <= seed_height {
+            let to = (next + BLOCKS_PER_BATCH - 1).min(seed_height);
+            let req = NetworkMessage::BlockRequest(BlockRequest {
+                from_height: next,
+                to_height: to,
+                request_id: req_id,
+            });
+            req_id += 1;
+
+            if send_msg(&mut stream, &req).await.is_err() { break; }
+
+            match recv_msg(&mut stream).await {
+                Ok(NetworkMessage::BlockResponse(resp)) => {
+                    let count = resp.blocks.len();
+                    for block in resp.blocks {
+                        let _ = sync_tx.send(block).await;
+                    }
+                    info!("📥 {} blocs reçus (#{}-#{})", count, next, to);
+                    next = to + 1;
+                }
+                _ => break,
+            }
+            // Small yield to let main loop apply the blocks
+            sleep(Duration::from_millis(50)).await;
+        }
+        info!("✅ Sync terminé à hauteur #{}", seed_height);
+
+        // ── Live mode: receive new blocks as they are produced ─────────────
+        loop {
+            match recv_msg(&mut stream).await {
+                Ok(NetworkMessage::NewBlock(block)) => {
+                    info!("📥 Nouveau bloc #{} reçu du seed", block.header.height);
+                    let _ = sync_tx.send(*block).await;
+                }
+                Ok(NetworkMessage::Bye) | Err(_) => {
+                    info!("🔌 Seed déconnecté — reconnexion dans 5s");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        sleep(Duration::from_secs(5)).await;
     }
 }
 
