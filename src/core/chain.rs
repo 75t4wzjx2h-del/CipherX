@@ -11,10 +11,11 @@
 use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::core::block::{Block, BlockHash};
 use crate::core::transaction::{Transaction, TxId, TxType, StealthOutput, PedersenCommitment};
+use crate::storage::db::CipherXDb;
 
 /// CipherX testnet identity
 pub const CHAIN_ID: u64 = 0x43495054; // "CIPT" — CipherX IP Testnet
@@ -157,10 +158,13 @@ pub struct Chain {
 
     /// Hash of the current tip
     pub tip_hash: BlockHash,
+
+    /// RocksDB persistence (None = in-memory only, used in tests)
+    db: Option<CipherXDb>,
 }
 
 impl Chain {
-    /// Initialize a new chain with genesis block
+    /// In-memory chain — used in tests and as base for open()
     pub fn new() -> Self {
         let genesis = Block::genesis();
         let genesis_hash = genesis.hash();
@@ -179,11 +183,58 @@ impl Chain {
             utxo_set: HashMap::new(),
             spent_key_images: HashSet::new(),
             pending_exits: vec![],
-            total_validators: 1, // starts with 1 (owner)
-            circulating_supply: ChainParams::PREMINE * 1_000_000_000, // premine in nCIP
+            total_validators: 1,
+            circulating_supply: ChainParams::PREMINE * 1_000_000_000,
             height: 0,
             tip_hash: genesis_hash,
+            db: None,
         }
+    }
+
+    /// Open (or create) a persistent chain backed by RocksDB at `path`.
+    /// Replays all stored blocks to rebuild the in-memory UTXO set and key images.
+    pub fn open(path: &str) -> Self {
+        let mut chain = Self::new();
+
+        let db = match CipherXDb::open(path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("⚠️  RocksDB open failed ({}): running in-memory only", e);
+                return chain;
+            }
+        };
+
+        // Restore chain from DB
+        match db.load_chain_state() {
+            Ok(Some((stored_height, _))) if stored_height > 0 => {
+                info!("💾 Restoring chain from DB: {} blocks…", stored_height);
+                for h in 1..=stored_height {
+                    match db.get_block_by_height(h) {
+                        Ok(Some(block)) => {
+                            let block_hash = block.hash();
+                            // apply_block rebuilds UTXO set + key images + supply
+                            if chain.apply_block(&block).is_ok() {
+                                chain.height = h;
+                                chain.tip_hash = block_hash.clone();
+                                chain.blocks_by_height.push(block_hash.clone());
+                                chain.blocks_by_hash.insert(block_hash, block);
+                            }
+                        }
+                        Ok(None) => { warn!("⚠️  Missing block #{} in DB — stopping replay", h); break; }
+                        Err(e)   => { warn!("⚠️  DB error at #{}: {} — stopping replay", h, e); break; }
+                    }
+                }
+                info!("✅ Chain restored: height={} | UTXOs={} | supply={} CIP",
+                    chain.height,
+                    chain.utxo_set.len(),
+                    chain.circulating_supply / 1_000_000_000);
+            }
+            Ok(_) => info!("💾 Empty DB — starting fresh"),
+            Err(e) => warn!("⚠️  Could not read DB chain state: {}", e),
+        }
+
+        chain.db = Some(db);
+        chain
     }
 
     /// Get current tip block
@@ -261,7 +312,17 @@ impl Chain {
         self.height = expected_height;
         self.tip_hash = block_hash.clone();
         self.blocks_by_height.push(block_hash.clone());
-        self.blocks_by_hash.insert(block_hash.clone(), block);
+        self.blocks_by_hash.insert(block_hash.clone(), block.clone());
+
+        // 6. Persist to RocksDB
+        if let Some(db) = &self.db {
+            if let Err(e) = db.put_block(&block) {
+                warn!("DB put_block #{}: {}", expected_height, e);
+            }
+            if let Err(e) = db.save_chain_state(self.height, &self.tip_hash) {
+                warn!("DB save_chain_state: {}", e);
+            }
+        }
 
         info!("✅ Block #{} accepted | hash: {}", expected_height, block_hash.to_hex());
 

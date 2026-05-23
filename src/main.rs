@@ -35,7 +35,11 @@ async fn main() -> anyhow::Result<()> {
     print_banner();
 
     // ── Chain ─────────────────────────────────────────────────────────────
-    let chain = Arc::new(RwLock::new(Chain::new()));
+    let db_path = std::env::var("CIPHERX_DB_PATH").unwrap_or_else(|_| {
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        home.join(".cipherx").join("chain").to_string_lossy().to_string()
+    });
+    let chain = Arc::new(RwLock::new(Chain::open(&db_path)));
     let stats = chain.read().await.stats();
     info!("⛓️  Hauteur: {} | Tip: {}", stats.height, &stats.tip_hash[..16]);
     info!("💰 Supply: {} / 100,000,000 CIP", stats.circulating_supply_cip);
