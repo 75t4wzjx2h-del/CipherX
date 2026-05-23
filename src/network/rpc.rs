@@ -29,9 +29,12 @@ use serde_json::{Value, json};
 
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
+    #[serde(default)]
     pub jsonrpc: String,
+    #[serde(default)]
     pub id: Value,
     pub method: String,
+    #[serde(default)]
     pub params: Vec<Value>,
 }
 
@@ -240,14 +243,45 @@ fn rpc_tx_status(id: Value, params: &[Value]) -> RpcResponse {
     }))
 }
 
-fn rpc_send_raw_tx(id: Value, params: &[Value]) -> RpcResponse {
-    let _raw = match params.first().and_then(|v| v.as_str()) {
+fn rpc_send_raw_tx(id: Value, _params: &[Value]) -> RpcResponse {
+    // Handled externally via handle_send_raw_tx (requires mempool access)
+    RpcResponse::err(id, ERR_INTERNAL, "Use handle_send_raw_tx with mempool".to_string())
+}
+
+/// Real sendRawTransaction handler — decodes bot lite tx, validates, pushes to mempool.
+/// Called directly from run_rpc_server which has mempool access.
+pub fn handle_send_raw_tx(
+    request: &RpcRequest,
+    mempool: &std::sync::Mutex<Vec<crate::core::transaction::Transaction>>,
+) -> RpcResponse {
+    use crate::core::transaction::Transaction;
+
+    let id = request.id.clone();
+    let raw_hex = match request.params.first().and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return RpcResponse::err(id, ERR_PARAMS, "Expected raw tx hex".to_string()),
     };
-    // Real impl: deserialize + validate + add to mempool
-    let fake_id = format!("0x{}", hex::encode([0u8; 32]));
-    RpcResponse::ok(id, json!(fake_id))
+
+    let json_bytes = match hex::decode(raw_hex) {
+        Ok(b) => b,
+        Err(_) => return RpcResponse::err(id, ERR_PARAMS, "Invalid hex encoding".to_string()),
+    };
+
+    let json_str = match std::str::from_utf8(&json_bytes) {
+        Ok(s) => s,
+        Err(_) => return RpcResponse::err(id, ERR_PARAMS, "Invalid UTF-8 in payload".to_string()),
+    };
+
+    match Transaction::from_lite_raw(json_str) {
+        Some(tx) => {
+            let tx_id = tx.id();
+            mempool.lock().unwrap().push(tx);
+            let tx_id_hex = format!("0x{}", hex::encode(tx_id.0));
+            tracing::info!("📨 Tx reçue → mempool | id: {}", &tx_id_hex[..18]);
+            RpcResponse::ok(id, json!(tx_id_hex))
+        }
+        None => RpcResponse::err(id, ERR_PARAMS, "Invalid transaction format".to_string()),
+    }
 }
 
 fn rpc_chain_id(id: Value) -> RpcResponse {

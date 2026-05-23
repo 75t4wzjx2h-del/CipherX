@@ -471,6 +471,65 @@ fn load_and_decrypt(path: &PathBuf) -> Result<WalletData, String> {
     result
 }
 
+// ── Scan state cache ──────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ScanState {
+    /// Last block height fully scanned
+    last_scanned_block: u64,
+    /// Detected outputs (tx_pubkey hex, one_time_pubkey hex, block_height)
+    detected_outputs: Vec<DetectedOutput>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DetectedOutput {
+    /// R = tx_pubkey (hex)
+    tx_pubkey: String,
+    /// P = one_time_pubkey (hex)
+    one_time_pubkey: String,
+    /// Encrypted amount bytes (hex) — decryptable with shared secret
+    encrypted_amount: String,
+    /// Block height where this output appeared
+    block_height: u64,
+    /// Output index within the transaction
+    output_index: u32,
+    /// Transaction ID (hex)
+    tx_id: String,
+}
+
+impl Default for ScanState {
+    fn default() -> Self {
+        ScanState {
+            last_scanned_block: 0,
+            detected_outputs: vec![],
+        }
+    }
+}
+
+fn scan_state_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".cipherx").join("scan_state.json")
+}
+
+fn load_scan_state() -> ScanState {
+    let path = scan_state_path();
+    if let Ok(content) = fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        ScanState::default()
+    }
+}
+
+fn save_scan_state(state: &ScanState) {
+    let path = scan_state_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(state) {
+        let _ = fs::write(&path, json);
+    }
+}
+
 // ── RPC Client ────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -527,6 +586,116 @@ fn get_peer_count(rpc_url: &str) -> Option<u64> {
     let result = rpc_call(rpc_url, "cipherx_peerCount", vec![])?;
     let hex_str = result.as_str()?;
     u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
+}
+
+/// Get outputs for a range of blocks via RPC.
+/// Returns a list of (tx_pubkey, one_time_pubkey, encrypted_amount, block_height, output_index, tx_id).
+fn get_outputs_in_range(
+    rpc_url: &str,
+    from: u64,
+    to: u64,
+) -> Vec<(String, String, String, u64, u32, String)> {
+    let result = rpc_call(
+        rpc_url,
+        "cipherx_getOutputs",
+        vec![serde_json::json!(from), serde_json::json!(to)],
+    );
+
+    if let Some(val) = result {
+        if let Some(arr) = val.as_array() {
+            let mut outputs = Vec::new();
+            for item in arr {
+                let tx_pubkey = item["tx_pubkey"].as_str().unwrap_or("").to_string();
+                let one_time_pubkey = item["one_time_pubkey"].as_str().unwrap_or("").to_string();
+                let encrypted_amount = item["encrypted_amount"].as_str().unwrap_or("").to_string();
+                let block_height = item["block_height"].as_u64().unwrap_or(0);
+                let output_index = item["output_index"].as_u64().unwrap_or(0) as u32;
+                let tx_id = item["tx_id"].as_str().unwrap_or("").to_string();
+                if !tx_pubkey.is_empty() && !one_time_pubkey.is_empty() {
+                    outputs.push((tx_pubkey, one_time_pubkey, encrypted_amount, block_height, output_index, tx_id));
+                }
+            }
+            return outputs;
+        }
+    }
+    vec![]
+}
+
+/// Scan outputs from block `from_block` to `to_block` for outputs belonging to the wallet.
+///
+/// Tests each output via stealth address derivation (view key scan).
+/// Returns the list of detected outputs and updates the scan state cache.
+fn scan_outputs(
+    wallet: &WalletData,
+    rpc_url: &str,
+    from_block: u64,
+    to_block: u64,
+) -> Vec<DetectedOutput> {
+    use curve25519_dalek::scalar::Scalar;
+
+    // Decode view key
+    let view_key_bytes = match hex::decode(&wallet.private_view) {
+        Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
+        _ => return vec![],
+    };
+    let public_spend_bytes = match hex::decode(&wallet.public_spend) {
+        Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
+        _ => return vec![],
+    };
+
+    let view_key = cipherx::crypto::keys::ViewKey(view_key_bytes);
+    let spend_pubkey = cipherx::crypto::keys::PublicKey(public_spend_bytes);
+
+    let outputs = get_outputs_in_range(rpc_url, from_block, to_block);
+    let mut detected = Vec::new();
+
+    for (tx_pubkey_hex, one_time_pubkey_hex, encrypted_amount_hex, block_height, output_index, tx_id) in outputs {
+        let tx_pubkey_bytes = match hex::decode(&tx_pubkey_hex) {
+            Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
+            _ => continue,
+        };
+        let one_time_pubkey_bytes = match hex::decode(&one_time_pubkey_hex) {
+            Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
+            _ => continue,
+        };
+
+        let result = cipherx::crypto::stealth::scan_output(
+            &tx_pubkey_bytes,
+            &one_time_pubkey_bytes,
+            output_index,
+            &view_key,
+            &spend_pubkey,
+        );
+
+        if result.is_some() {
+            // Decrypt amount if shared secret is available
+            // (The scan_output returns s_i bytes which IS the shared secret scalar)
+            let decrypted_amount_ncip = if let Some(s_i_bytes) = &result {
+                let s_i = Scalar::from_canonical_bytes(*s_i_bytes);
+                if s_i.is_some().into() {
+                    let encrypted = hex::decode(&encrypted_amount_hex).unwrap_or_default();
+                    cipherx::crypto::ringct::decrypt_amount(&encrypted, &s_i.unwrap())
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let _ = decrypted_amount_ncip; // used in history display
+
+            detected.push(DetectedOutput {
+                tx_pubkey: tx_pubkey_hex,
+                one_time_pubkey: one_time_pubkey_hex,
+                encrypted_amount: encrypted_amount_hex,
+                block_height,
+                output_index,
+                tx_id,
+            });
+        }
+    }
+
+    detected
 }
 
 // ── Formatage ─────────────────────────────────────────────────────────────────
@@ -717,18 +886,94 @@ fn cmd_balance(path: &PathBuf, rpc_url: &str) {
             let connected = height.is_some();
 
             if connected {
-                println!("  🟢 Nœud connecté | Bloc #{}", height.unwrap());
+                let current_height = height.unwrap();
+                println!("  🟢 Nœud connecté | Bloc #{}", current_height);
                 println!();
-                println!("  💰 Disponible    : 0.0000 CIP");
+
+                // Load cached scan state and scan new blocks
+                let mut scan_state = load_scan_state();
+                let from_block = scan_state.last_scanned_block + 1;
+
+                if from_block <= current_height {
+                    println!("  🔍 Scan des blocs {} à {}...", from_block, current_height);
+                    let new_outputs = scan_outputs(&wallet, rpc_url, from_block, current_height);
+                    scan_state.detected_outputs.extend(new_outputs);
+                    scan_state.last_scanned_block = current_height;
+                    save_scan_state(&scan_state);
+                }
+
+                // Compute balance from detected outputs
+                // (Each output with a decryptable amount contributes to balance)
+                let total_outputs = scan_state.detected_outputs.len();
+
+                // Decrypt amounts from detected outputs
+                let mut total_ncip: u64 = 0;
+                {
+                    use curve25519_dalek::scalar::Scalar;
+                    let view_key_bytes = hex::decode(&wallet.private_view)
+                        .unwrap_or_default();
+                    let view_key_arr: Option<[u8; 32]> = view_key_bytes.try_into().ok();
+
+                    if let Some(vk_arr) = view_key_arr {
+                        let view_key = cipherx::crypto::keys::ViewKey(vk_arr);
+                        let spend_pub_bytes = hex::decode(&wallet.public_spend)
+                            .unwrap_or_default();
+                        let spend_arr: Option<[u8; 32]> = spend_pub_bytes.try_into().ok();
+
+                        if let Some(sp_arr) = spend_arr {
+                            let spend_pubkey = cipherx::crypto::keys::PublicKey(sp_arr);
+
+                            for out in &scan_state.detected_outputs {
+                                let tx_pk: Option<[u8; 32]> = hex::decode(&out.tx_pubkey)
+                                    .ok().and_then(|b| b.try_into().ok());
+                                let ot_pk: Option<[u8; 32]> = hex::decode(&out.one_time_pubkey)
+                                    .ok().and_then(|b| b.try_into().ok());
+
+                                if let (Some(tx_pk), Some(ot_pk)) = (tx_pk, ot_pk) {
+                                    let s_i_opt = cipherx::crypto::stealth::scan_output(
+                                        &tx_pk, &ot_pk, out.output_index,
+                                        &view_key, &spend_pubkey,
+                                    );
+                                    if let Some(s_i_bytes) = s_i_opt {
+                                        let s_i = Scalar::from_canonical_bytes(s_i_bytes);
+                                        if s_i.is_some().into() {
+                                            let enc = hex::decode(&out.encrypted_amount)
+                                                .unwrap_or_default();
+                                            let amount = cipherx::crypto::ringct::decrypt_amount(
+                                                &enc, &s_i.unwrap()
+                                            ).unwrap_or(0);
+                                            total_ncip = total_ncip.saturating_add(amount);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let total_cip = total_ncip as f64 / 1_000_000_000.0;
+                println!("  💰 Disponible    : {:.4} CIP", total_cip);
                 println!("  ⬡  En staking   : 0.0000 CIP");
                 println!("  ─────────────────────────────");
-                println!("  📊 Total         : 0.0000 CIP");
+                println!("  📊 Total         : {:.4} CIP", total_cip);
                 println!();
-                println!("  ℹ️  Le scan des outputs sera disponible");
-                println!("     une fois le nœud RPC complet déployé.");
+                if total_outputs > 0 {
+                    println!("  📦 Outputs reçus : {}", total_outputs);
+                    println!("  🔍 Dernier scan  : bloc #{}", scan_state.last_scanned_block);
+                } else {
+                    println!("  ℹ️  Aucun output détecté (scan jusqu'au bloc #{})", scan_state.last_scanned_block);
+                }
             } else {
+                // Offline: show cached balance
+                let scan_state = load_scan_state();
                 println!("  🔴 Nœud non disponible ({})", rpc_url);
                 println!("     Lancez le nœud avec: ./target/debug/cipherx-node");
+                println!();
+                if scan_state.last_scanned_block > 0 {
+                    println!("  📦 Outputs en cache : {} (scan jusqu'au bloc #{})",
+                        scan_state.detected_outputs.len(),
+                        scan_state.last_scanned_block);
+                }
             }
         }
         Err(e) => eprintln!("  {}", e),
@@ -754,82 +999,164 @@ fn cmd_receive(path: &PathBuf) {
     }
 }
 
+fn parse_cx1_address(addr: &str) -> Option<(cipherx::crypto::keys::PublicKey, cipherx::crypto::keys::PublicKey)> {
+    let b58_part = addr.strip_prefix("CX1")?;
+    let bytes = bs58::decode(b58_part).into_vec().ok()?;
+    // 64 bytes keys + 4 bytes checksum = 68 bytes
+    if bytes.len() != 68 { return None; }
+    // Verify checksum
+    let mut h = Sha3_256::new();
+    h.update(b"CipherX_addr_v1");
+    h.update(&bytes[..64]);
+    let expected: [u8; 32] = h.finalize().into();
+    if bytes[64..] != expected[..4] { return None; }
+    let mut spend = [0u8; 32];
+    let mut view  = [0u8; 32];
+    spend.copy_from_slice(&bytes[..32]);
+    view.copy_from_slice(&bytes[32..64]);
+    Some((cipherx::crypto::keys::PublicKey(spend), cipherx::crypto::keys::PublicKey(view)))
+}
+
 fn cmd_send(path: &PathBuf, rpc_url: &str, to: &str, amount: f64, note: Option<&str>) {
-    if !to.starts_with("CX1") || to.len() < 10 {
-        eprintln!("  ❌ Adresse invalide. Elle doit commencer par CX1");
+    if !to.starts_with("CX1") || to.len() < 50 {
+        eprintln!("  ❌ Adresse invalide (format: CX1...)");
         std::process::exit(1);
     }
-    if !(amount > 0.0 && amount.is_finite()) {
+    if !(amount > 0.0 && amount.is_finite()) || amount > 1e9 {
         eprintln!("  ❌ Montant invalide");
         std::process::exit(1);
     }
-    // Sanity bound — refuse absurd amounts that could overflow u64 conversion
-    if amount > 1e18 {
-        eprintln!("  ❌ Montant trop élevé");
-        std::process::exit(1);
+
+    let (spend_pub, view_pub) = match parse_cx1_address(to) {
+        Some(keys) => keys,
+        None => {
+            eprintln!("  ❌ Impossible de décoder l'adresse CX1");
+            std::process::exit(1);
+        }
+    };
+
+    let wallet = match load_and_decrypt(path) {
+        Ok(w) => w,
+        Err(e) => { eprintln!("  {}", e); return; }
+    };
+
+    let amount_ncip = (amount * 1_000_000_000.0) as u64;
+    let fee_ncip    = 21_000u64 * 1_000u64;
+
+    print_header("Envoyer des CIP");
+    println!();
+    println!("  📤 Expéditeur  : {}", short_addr(&wallet.address));
+    println!("  📥 Destinataire: {}", short_addr(to));
+    println!("  💰 Montant     : {} CIP", amount);
+    println!("  ⛽ Frais       : {}", format_cip(fee_ncip));
+    println!("  ──────────────────────────────────────────");
+    println!("  📊 Total       : {}", format_cip(amount_ncip.saturating_add(fee_ncip)));
+    if let Some(n) = note {
+        println!("  📝 Note        : {}", n);
+    }
+    println!();
+    println!("  🔒 Mode        : Lite (testnet — sans ring signatures)");
+    println!("  🔒 Stealth     : one-time address générée pour le destinataire");
+    println!();
+    print!("  Confirmer ? (oui/non): ");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok();
+    if input.trim().to_lowercase() != "oui" {
+        println!("  Annulé.");
+        return;
     }
 
-    match load_and_decrypt(path) {
-        Ok(wallet) => {
-            let amount_ncip = (amount * 1_000_000_000.0) as u64;
-            let fee_ncip = 21_000u64 * 1_000u64; // 21k gas * 1000 nCIP/gas
+    // Build stealth output for recipient
+    let recipient = cipherx::crypto::keys::StealthAddress {
+        public_spend: spend_pub,
+        public_view:  view_pub,
+    };
+    let output_keys = match cipherx::crypto::stealth::generate_output(&recipient, 0) {
+        Ok(k) => k,
+        Err(e) => { eprintln!("  ❌ Erreur stealth: {}", e); return; }
+    };
+    let encrypted_amount = cipherx::crypto::ringct::encrypt_amount(amount_ncip, &output_keys.shared_secret);
 
-            print_header("Envoyer des CIP");
+    // Serialize to JSON, hex-encode, submit via RPC
+    let payload = serde_json::json!({
+        "tx_pubkey":        hex::encode(output_keys.tx_pubkey),
+        "one_time_pubkey":  hex::encode(output_keys.one_time_pubkey),
+        "encrypted_amount": hex::encode(&encrypted_amount),
+        "amount_ncip":      amount_ncip,
+    });
+    let json_bytes = payload.to_string();
+    let hex_payload = hex::encode(json_bytes.as_bytes());
+
+    match rpc_call(rpc_url, "cipherx_sendRawTransaction", vec![serde_json::Value::String(hex_payload)]) {
+        Some(result) => {
+            let tx_id = result.as_str().unwrap_or("unknown");
             println!();
-            println!("  📤 Expéditeur : {}", short_addr(&wallet.address));
-            println!("  📥 Destinataire: {}", short_addr(to));
-            println!("  💰 Montant     : {} CIP", amount);
-            println!("  ⛽ Frais       : {}", format_cip(fee_ncip));
-            println!("  ─────────────────────────────────────────");
-            println!("  📊 Total       : {}", format_cip(amount_ncip.saturating_add(fee_ncip)));
-            if let Some(n) = note {
-                println!("  📝 Note        : {}", n);
-            }
-            println!();
-            println!("  🔒 Ring signatures: 11 membres (10 leurres)");
-            println!("  🔒 Stealth address: one-time address générée");
-            println!("  🔒 RingCT: montant caché par engagement Pedersen");
-            println!();
-            print!("  Confirmer ? (oui/non): ");
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).ok();
-
-            if input.trim().to_lowercase() != "oui" {
-                println!("  Annulé.");
-                return;
-            }
-
-            let mut tx_hash = [0u8; 32];
-            OsRng.fill_bytes(&mut tx_hash);
-            let tx_id = hex::encode(tx_hash);
-
-            println!();
-            println!("  ✅ Transaction construite et diffusée !");
+            println!("  ✅ Transaction diffusée !");
             println!();
             println!("  🔑 TX ID:");
             println!("  {}", tx_id);
             println!();
             println!("  ⏱️  Confirmation dans ~400ms");
-            println!("  🔍 La transaction est invisible sur la blockchain");
-
-            let _ = rpc_url;
         }
-        Err(e) => eprintln!("  {}", e),
+        None => {
+            eprintln!("  ❌ Échec de l'envoi — nœud injoignable ou transaction rejetée");
+        }
     }
 }
 
-fn cmd_history(_path: &PathBuf, _rpc_url: &str, limit: usize) {
-    print_header("Historique");
-    println!();
-    println!("  ℹ️  Le scan de l'historique nécessite la view key");
-    println!("     et un nœud RPC complet.");
-    println!();
-    println!("  Cette fonctionnalité sera disponible dans la prochaine");
-    println!("  mise à jour avec le scan UTXO complet.");
-    println!();
-    println!("  Limite demandée: {} transactions", limit);
+fn cmd_history(path: &PathBuf, rpc_url: &str, limit: usize) {
+    match load_and_decrypt(path) {
+        Ok(wallet) => {
+            print_header("Historique des outputs reçus");
+            println!();
+
+            // Attempt to scan for new blocks first
+            let current_height = get_chain_height(rpc_url);
+            let mut scan_state = load_scan_state();
+
+            if let Some(height) = current_height {
+                let from_block = scan_state.last_scanned_block + 1;
+                if from_block <= height {
+                    println!("  🔍 Scan des blocs {} à {}...", from_block, height);
+                    let new_outputs = scan_outputs(&wallet, rpc_url, from_block, height);
+                    scan_state.detected_outputs.extend(new_outputs);
+                    scan_state.last_scanned_block = height;
+                    save_scan_state(&scan_state);
+                }
+            }
+
+            if scan_state.detected_outputs.is_empty() {
+                println!("  ℹ️  Aucun output reçu détecté.");
+                if scan_state.last_scanned_block == 0 {
+                    println!("     Lancer un nœud pour commencer le scan.");
+                } else {
+                    println!("     Dernier scan: bloc #{}", scan_state.last_scanned_block);
+                }
+                return;
+            }
+
+            println!("  📦 {} output(s) détecté(s) — affichage des {} derniers:",
+                scan_state.detected_outputs.len(), limit);
+            println!();
+
+            let outputs_to_show: Vec<_> = scan_state.detected_outputs.iter().rev().take(limit).collect();
+
+            for (i, out) in outputs_to_show.iter().enumerate() {
+                println!("  ┌─ Output #{}", i + 1);
+                println!("  │  Bloc       : #{}", out.block_height);
+                println!("  │  TX ID      : {}...", &out.tx_id[..std::cmp::min(16, out.tx_id.len())]);
+                println!("  │  Pubkey     : {}...", &out.one_time_pubkey[..std::cmp::min(16, out.one_time_pubkey.len())]);
+                println!("  │  Index      : {}", out.output_index);
+                println!("  └─ Type      : Reçu (stealth)");
+                println!();
+            }
+
+            println!("  🔍 Dernier scan : bloc #{}", scan_state.last_scanned_block);
+        }
+        Err(e) => eprintln!("  {}", e),
+    }
 }
 
 fn cmd_stake(path: &PathBuf, rpc_url: &str, amount: f64) {

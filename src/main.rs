@@ -14,12 +14,14 @@ use cipherx::crypto::keys::{ValidatorCommitment, StealthAddress, PublicKey};
 use cipherx::network::tor::{TorClient, TorConfig};
 use cipherx::network::p2p::{P2PNode, P2PConfig, NetworkEvent};
 use cipherx::network::sync::SyncState;
-use cipherx::network::rpc::{RpcRequest, NodeState, BlockOutputRef, handle_request};
+use cipherx::network::rpc::{RpcRequest, NodeState, BlockOutputRef, handle_request, handle_send_raw_tx};
 use cipherx::network::p2p::{NetworkMessage, HelloMessage, BlockRequest, BlockResponse};
 use cipherx::network::sync_protocol::{send_msg, recv_msg, PROTOCOL_VERSION, BLOCKS_PER_BATCH};
 use tokio::sync::broadcast;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::net::SocketAddr;
+
+type Mempool = std::sync::Mutex<Vec<Transaction>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,9 +46,40 @@ async fn main() -> anyhow::Result<()> {
     let mut tor = TorClient::new(TorConfig::default());
     tor.start().await.map_err(|e| anyhow::anyhow!(e))?;
 
+    // ── Reward address ────────────────────────────────────────────────────
+    let reward_address = load_reward_address();
+
+    // ── Seed nodes (env override, fallback to hardcoded testnet seeds) ────
+    let env_seeds: Vec<String> = std::env::var("CIPHERX_SEED_NODES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Hardcoded testnet seed — override via CIPHERX_SEED_NODES env var
+    const TESTNET_SEEDS: &[&str] = &["141.11.243.5:9152"];
+
+    let seed_nodes: Vec<String> = if !env_seeds.is_empty() {
+        env_seeds
+    } else {
+        // Skip hardcoded seeds when our own IP matches (don't connect to self)
+        let our_ip = std::env::var("CIPHERX_PUBLIC_IP").unwrap_or_default();
+        TESTNET_SEEDS
+            .iter()
+            .filter(|s| our_ip.is_empty() || !s.starts_with(&our_ip))
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let is_sync_mode = !seed_nodes.is_empty();
+
     // ── P2P ───────────────────────────────────────────────────────────────
+    let p2p_config = P2PConfig {
+        seed_nodes: seed_nodes.clone(),
+        ..P2PConfig::default()
+    };
     let (event_tx, mut event_rx) = mpsc::channel::<NetworkEvent>(1000);
-    let mut p2p = P2PNode::new(P2PConfig::default(), event_tx);
+    let mut p2p = P2PNode::new(p2p_config, event_tx);
     info!("🌐 P2P initialisé | pairs: {}", p2p.peer_count());
 
     // ── Consensus (mode solo — 1 validateur) ──────────────────────────────
@@ -60,18 +93,6 @@ async fn main() -> anyhow::Result<()> {
         Some(commitment),
     );
     consensus.start_height(1);
-
-    // ── Reward address ────────────────────────────────────────────────────
-    let reward_address = load_reward_address();
-
-    // ── Mode détection ────────────────────────────────────────────────────
-    let seed_nodes: Vec<String> = std::env::var("CIPHERX_SEED_NODES")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let is_sync_mode = !seed_nodes.is_empty();
 
     if is_sync_mode {
         info!("🔄 Mode SYNC — seed: {:?}", seed_nodes);
@@ -89,8 +110,11 @@ async fn main() -> anyhow::Result<()> {
     // ── Peer counter (pour RPC peerCount) ─────────────────────────────────
     let peer_count = Arc::new(AtomicUsize::new(0));
 
+    // ── Mempool (transactions en attente d'inclusion) ─────────────────────
+    let mempool: Arc<Mempool> = Arc::new(Mempool::default());
+
     // ── RPC + P2P servers ─────────────────────────────────────────────────
-    tokio::spawn(run_rpc_server(chain.clone(), peer_count.clone()));
+    tokio::spawn(run_rpc_server(chain.clone(), peer_count.clone(), mempool.clone()));
     tokio::spawn(run_p2p_listener(chain.clone(), block_bcast_tx.clone(), peer_count.clone()));
 
     // ── Connexion aux seeds (mode sync uniquement) ─────────────────────────
@@ -152,7 +176,13 @@ async fn main() -> anyhow::Result<()> {
                         (c.height + 1, c.tip_hash.clone())
                     };
 
-                    let block = build_block(next_height, prev_hash, reward_address.as_ref());
+                    // Drain mempool — include pending lite transactions in the block
+                    let pending: Vec<Transaction> = mempool.lock().unwrap().drain(..).collect();
+                    if !pending.is_empty() {
+                        info!("📦 {} transaction(s) du mempool incluse(s)", pending.len());
+                    }
+
+                    let block = build_block(next_height, prev_hash, reward_address.as_ref(), pending);
 
                     if let Some(finalized) = drive_solo_consensus(&mut consensus, block) {
                         let mut chain_w = chain.write().await;
@@ -255,8 +285,9 @@ fn parse_stealth_address(addr: &str) -> Option<StealthAddress> {
     })
 }
 
-/// Construit un bloc valide à la hauteur donnée avec coinbase
-fn build_block(height: u64, prev_hash: BlockHash, reward_address: Option<&StealthAddress>) -> Block {
+/// Construit un bloc valide à la hauteur donnée avec coinbase + txs du mempool
+fn build_block(height: u64, prev_hash: BlockHash, reward_address: Option<&StealthAddress>,
+               pending_txs: Vec<Transaction>) -> Block {
     use cipherx::core::chain::ChainParams;
     let reward = ChainParams::block_reward(height);
 
@@ -265,7 +296,8 @@ fn build_block(height: u64, prev_hash: BlockHash, reward_address: Option<&Stealt
     } else {
         Transaction::coinbase_placeholder(height)
     };
-    let txs = vec![coinbase];
+    let mut txs = vec![coinbase];
+    txs.extend(pending_txs);
     let tx_root = Block::compute_tx_root(&txs);
     let header = BlockHeader {
         version: 1,
@@ -304,7 +336,8 @@ fn drive_solo_consensus(engine: &mut TendermintEngine, block: Block) -> Option<B
 }
 
 /// Minimal HTTP JSON-RPC server on 127.0.0.1:8545
-async fn run_rpc_server(chain: Arc<RwLock<Chain>>, peer_count: Arc<AtomicUsize>) {
+async fn run_rpc_server(chain: Arc<RwLock<Chain>>, peer_count: Arc<AtomicUsize>,
+                         mempool: Arc<Mempool>) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -315,14 +348,37 @@ async fn run_rpc_server(chain: Arc<RwLock<Chain>>, peer_count: Arc<AtomicUsize>)
 
     loop {
         let Ok((mut stream, _)) = listener.accept().await else { continue };
-        let chain_c = chain.clone();
-        let pc = peer_count.clone();
+        let chain_c  = chain.clone();
+        let pc       = peer_count.clone();
+        let mempool_c = mempool.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 32768];
-            let n = match stream.read(&mut buf).await { Ok(n) => n, Err(_) => return };
-            if n == 0 { return; }
+            // Read the full HTTP request: headers then body per Content-Length
+            let mut buf = Vec::with_capacity(8192);
+            // Phase 1: read until \r\n\r\n
+            loop {
+                let mut byte = [0u8; 1];
+                match stream.read_exact(&mut byte).await {
+                    Ok(_) => buf.push(byte[0]),
+                    Err(_) => return,
+                }
+                if buf.ends_with(b"\r\n\r\n") { break; }
+                if buf.len() > 16384 { return; }
+            }
+            // Phase 2: extract Content-Length and read body
+            let header_str = String::from_utf8_lossy(&buf);
+            let content_length: usize = header_str.lines()
+                .find(|l| l.to_lowercase().starts_with("content-length:"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if content_length > 0 {
+                let prev = buf.len();
+                buf.resize(prev + content_length, 0);
+                if stream.read_exact(&mut buf[prev..]).await.is_err() { return; }
+            }
+            if buf.is_empty() { return; }
 
-            let raw = String::from_utf8_lossy(&buf[..n]);
+            let raw = String::from_utf8_lossy(&buf);
 
             if raw.starts_with("OPTIONS") {
                 let cors = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n";
@@ -341,38 +397,48 @@ async fn run_rpc_server(chain: Arc<RwLock<Chain>>, peer_count: Arc<AtomicUsize>)
                 Err(_) => return,
             };
 
-            let state = {
-                let c = chain_c.read().await;
-                let s = c.stats();
-                let block_outputs = c.all_utxos().into_iter().map(|u| BlockOutputRef {
-                    tx_pubkey:        hex::encode(u.output.tx_pubkey),
-                    one_time_pubkey:  hex::encode(u.output.one_time_pubkey),
-                    amount_commitment: hex::encode(u.output.amount_commitment.0),
-                    encrypted_amount: hex::encode(&u.output.encrypted_amount),
-                    output_index:     u.output_index,
-                    tx_id:            hex::encode(u.tx_id.0),
-                    block_height:     u.block_height,
-                }).collect();
-                NodeState {
-                    chain_height: s.height,
-                    tip_hash: [0u8; 32],
-                    peer_count: pc.load(Ordering::Relaxed),
-                    syncing: false,
-                    sync_progress: 1.0,
-                    base_fee_per_gas: 0,
-                    circulating_supply_ncip: s.circulating_supply_cip * 1_000_000_000,
-                    block_reward_ncip: s.next_block_reward_cip * 1_000_000_000,
-                    block_outputs,
-                }
+            // sendRawTransaction is handled here with mempool access
+            let resp = if rpc_req.method == "cipherx_sendRawTransaction" {
+                handle_send_raw_tx(&rpc_req, &mempool_c)
+            } else {
+                let state = {
+                    let c = chain_c.read().await;
+                    let s = c.stats();
+                    let block_outputs = c.all_utxos().into_iter().map(|u| BlockOutputRef {
+                        tx_pubkey:         hex::encode(u.output.tx_pubkey),
+                        one_time_pubkey:   hex::encode(u.output.one_time_pubkey),
+                        amount_commitment: hex::encode(u.output.amount_commitment.0),
+                        encrypted_amount:  hex::encode(&u.output.encrypted_amount),
+                        output_index:      u.output_index,
+                        tx_id:             hex::encode(u.tx_id.0),
+                        block_height:      u.block_height,
+                    }).collect();
+                    NodeState {
+                        chain_height:            s.height,
+                        tip_hash:                [0u8; 32],
+                        peer_count:              pc.load(Ordering::Relaxed),
+                        syncing:                 false,
+                        sync_progress:           1.0,
+                        base_fee_per_gas:        0,
+                        circulating_supply_ncip: s.circulating_supply_cip * 1_000_000_000,
+                        block_reward_ncip:       s.next_block_reward_cip * 1_000_000_000,
+                        block_outputs,
+                    }
+                };
+                handle_request(&rpc_req, &state)
             };
 
-            let resp = handle_request(&rpc_req, &state);
             let resp_body = serde_json::to_string(&resp).unwrap_or_default();
             let http = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
                 resp_body.len(), resp_body
             );
             let _ = stream.write_all(http.as_bytes()).await;
+            // Drain remaining receive buffer so drop sends FIN not RST
+            let mut drain = [0u8; 256];
+            while let Ok(n) = stream.read(&mut drain).await {
+                if n == 0 { break; }
+            }
         });
     }
 }
