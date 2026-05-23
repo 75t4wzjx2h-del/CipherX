@@ -26,8 +26,8 @@ pub const IS_TESTNET: bool = true;
 pub struct ChainParams;
 
 impl ChainParams {
-    /// Total supply cap
-    pub const MAX_SUPPLY: u64 = 100_000_000;
+    /// Supply maximale : 18 400 000 CIP (inspiré Monero ~18.4M XMR)
+    pub const MAX_SUPPLY: u64 = 18_400_000;
 
     /// Premine (0.002% of supply = 2000 CIP)
     pub const PREMINE: u64 = 2_000;
@@ -35,12 +35,16 @@ impl ChainParams {
     /// Minimum validator stake
     pub const MIN_STAKE: u64 = 31;
 
-    /// Initial block reward (in nCIP — nano CIP, 1 CIP = 1_000_000_000 nCIP)
-    pub const INITIAL_BLOCK_REWARD: u64 = 50 * 1_000_000_000;
+    /// Récompense initiale : 0.004 CIP/bloc = 864 CIP/jour au lancement
+    /// Économiquement stable : ~0.005% de la supply émis par jour
+    pub const INITIAL_BLOCK_REWARD: u64 = 4_000_000; // nCIP
 
-    /// Halving interval (~4 years at 1 block/sec = ~126_144_000 blocks)
-    /// Using 1s block time → 4 * 365.25 * 24 * 3600
+    /// Halving tous les ~4 ans (126 144 000 blocs à 400ms/bloc)
     pub const HALVING_INTERVAL: u64 = 126_144_000;
+
+    /// Tail emission perpétuelle — le réseau ne s'arrête jamais
+    /// 130 nCIP/bloc ≈ 0.028 CIP/jour à perpétuité (comme Monero)
+    pub const TAIL_EMISSION: u64 = 130; // nCIP
 
     /// Target block time in milliseconds (400ms — Solana-level)
     pub const BLOCK_TIME_MS: u64 = 400;
@@ -57,13 +61,30 @@ impl ChainParams {
     /// Ring size (number of decoys per input, including real)
     pub const RING_SIZE: usize = 11; // Monero uses 11 by default
 
-    /// Compute block reward at a given height (with halvings)
+    /// Calcule la récompense de bloc à une hauteur donnée.
+    /// Modèle : halvings successifs + tail emission perpétuelle.
+    ///
+    /// Émission :
+    ///   Bloc 0          : 0.004 CIP  (4 000 000 nCIP)
+    ///   Après halving 1 : 0.002 CIP
+    ///   Après halving 2 : 0.001 CIP
+    ///   Plancher        : 130 nCIP à perpétuité
+    ///
+    /// Production :
+    ///   Jour 1   : ~864 CIP  |  Année 1  : ~315 360 CIP
+    ///   Année 4  : ~157 680 CIP (1er halving)
+    ///   Supply max ~50 ans, puis tail perpétuelle
     pub fn block_reward(height: u64) -> u64 {
         let halvings = height / Self::HALVING_INTERVAL;
         if halvings >= 64 {
-            return 0; // Fully mined out
+            return Self::TAIL_EMISSION;
         }
-        Self::INITIAL_BLOCK_REWARD >> halvings
+        let reward = Self::INITIAL_BLOCK_REWARD >> halvings;
+        if reward <= Self::TAIL_EMISSION {
+            Self::TAIL_EMISSION
+        } else {
+            reward
+        }
     }
 
     /// Compute adaptive exit lock based on pending withdrawal queue
@@ -172,7 +193,10 @@ impl Chain {
         info!("⛓️  CipherX chain initialized");
         info!("📦 Genesis block: {}", genesis_hash.to_hex());
         info!("🔒 Ring size: {} | Block time: {}ms", ChainParams::RING_SIZE, ChainParams::BLOCK_TIME_MS);
-        info!("💰 Max supply: {} CIP | Premine: {} CIP", ChainParams::MAX_SUPPLY, ChainParams::PREMINE);
+        info!("💰 Max supply: {} CIP | Premine: {} CIP | Tail: {} nCIP/bloc",
+            ChainParams::MAX_SUPPLY, ChainParams::PREMINE, ChainParams::TAIL_EMISSION);
+        info!("📦 Récompense initiale: {} nCIP/bloc (~864 CIP/jour)",
+            ChainParams::INITIAL_BLOCK_REWARD);
 
         let mut blocks_by_hash = HashMap::new();
         blocks_by_hash.insert(genesis_hash.clone(), genesis);
@@ -444,14 +468,35 @@ mod tests {
 
     #[test]
     fn test_block_reward_halvings() {
-        // Initial reward
-        assert_eq!(ChainParams::block_reward(0), 50 * 1_000_000_000);
-        // After 1st halving
-        assert_eq!(ChainParams::block_reward(ChainParams::HALVING_INTERVAL), 25 * 1_000_000_000);
-        // After 2nd halving
-        assert_eq!(ChainParams::block_reward(ChainParams::HALVING_INTERVAL * 2), 12 * 1_000_000_000 + 500_000_000);
-        // Way in the future — no more reward
-        assert_eq!(ChainParams::block_reward(ChainParams::HALVING_INTERVAL * 100), 0);
+        // Récompense initiale
+        assert_eq!(ChainParams::block_reward(0), 4_000_000);
+        // Après 1er halving
+        assert_eq!(ChainParams::block_reward(ChainParams::HALVING_INTERVAL), 2_000_000);
+        // Après 2ème halving
+        assert_eq!(ChainParams::block_reward(ChainParams::HALVING_INTERVAL * 2), 1_000_000);
+        // Tail emission — jamais zéro
+        assert_eq!(ChainParams::block_reward(ChainParams::HALVING_INTERVAL * 64), ChainParams::TAIL_EMISSION);
+        assert_eq!(ChainParams::block_reward(ChainParams::HALVING_INTERVAL * 100), ChainParams::TAIL_EMISSION);
+    }
+
+    #[test]
+    fn test_tail_emission_never_zero() {
+        assert_eq!(ChainParams::block_reward(u64::MAX / 2), ChainParams::TAIL_EMISSION);
+        assert!(ChainParams::block_reward(u64::MAX / 2) > 0);
+    }
+
+    #[test]
+    fn test_emission_economics() {
+        // ~864 CIP par jour au lancement (216 000 blocs/jour à 400ms)
+        let blocs_par_jour = 216_000u64;
+        let emission_jour: u64 = (0..blocs_par_jour)
+            .map(|h| ChainParams::block_reward(h))
+            .sum();
+        // Entre 800 et 1000 CIP/jour
+        assert!(emission_jour >= 800 * 1_000_000_000,
+            "émission trop faible: {} CIP", emission_jour / 1_000_000_000);
+        assert!(emission_jour <= 1000 * 1_000_000_000,
+            "émission trop élevée: {} CIP", emission_jour / 1_000_000_000);
     }
 
     #[test]
